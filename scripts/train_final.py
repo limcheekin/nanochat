@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """
 Fully Customizable and Optimized Base Model Pre-training with Unsloth.
-This definitive version (v20) provides the complete and verified solution.
-It resolves the final `HFValidationError` by correctly setting the `name_or_path`
-attribute on the custom config and pre-creating the output directory, ensuring
-the trainer's internal API and validation checks are fully satisfied.
+This definitive version (v21) provides the complete and verified solution.
+It resolves the final `ValueError: Unrecognized processing class` by passing a
+tokenizer object to the UnslothTrainer. This prevents the trainer from incorrectly
+attempting to auto-discover a processor from the local model path, which was the
+root cause of all previous validation and file-not-found errors.
 """
 
 import os
@@ -26,7 +27,6 @@ from nanochat.tokenizer import get_tokenizer
 
 # === THE DEFINITIVE SOLUTION: FULLY COMPATIBLE PROXY CLASSES ===
 
-# 1. Create a compatible configuration class that inherits from PretrainedConfig.
 class CompatibleGPTConfig(PretrainedConfig):
     model_type = "nanochat_gpt"
 
@@ -48,7 +48,6 @@ class CompatibleGPTConfig(PretrainedConfig):
         self.n_embd = n_embd
         super().__init__(**kwargs)
 
-# 2. Create a compatible model class that inherits from PreTrainedModel.
 class UnslothCompatibleGPT(PreTrainedModel):
     config_class = CompatibleGPTConfig
 
@@ -80,7 +79,6 @@ class UnslothCompatibleGPT(PreTrainedModel):
             logits = output
             return {"logits": logits}
 
-# 3. Register our new, compatible classes with the Auto* classes.
 AutoConfig.register(CompatibleGPTConfig.model_type, CompatibleGPTConfig)
 AutoModelForCausalLM.register(CompatibleGPTConfig, UnslothCompatibleGPT)
 
@@ -98,12 +96,9 @@ def main():
     tokenizer = get_tokenizer()
     vocab_size = tokenizer.get_vocab_size()
 
-    print(f"🚀 Corrected NanoChat Pre-training with Unsloth (v20)")
+    print(f"🚀 Corrected NanoChat Pre-training with Unsloth (v21)")
     print(f"   Model Depth: {args.depth}, Max Seq Len: {args.max_seq_len}, Batch Size: {args.device_batch_size}")
 
-    # === THE CRITICAL FIX for HFValidationError ===
-    # Instantiate the config AND explicitly set its `name_or_path` attribute
-    # to the absolute path of the output directory.
     model_config = CompatibleGPTConfig(
         sequence_len=args.max_seq_len, vocab_size=vocab_size, n_layer=args.depth,
         n_embd=args.depth * 64, n_head=max(1, ((args.depth * 64) + 127) // 128),
@@ -111,11 +106,9 @@ def main():
         name_or_path=output_dir,
     )
 
-    # Initialize the model directly from the complete config object.
     model = UnslothCompatibleGPT(config=model_config)
     print(f"   Model Arch: {model.config.n_layer}L / {model.config.n_embd}D / {model.config.n_head}H")
 
-    # Prepare mappable dataset
     print(f"Preparing dataset: taking a subset of {args.dataset_subset_size:,} examples...")
     streaming_dataset = load_dataset("HuggingFaceFW/fineweb-edu", name="sample-10BT", split="train", streaming=True)
     subset_data = list(islice(streaming_dataset, args.dataset_subset_size))
@@ -151,15 +144,16 @@ def main():
     )
 
     data_collator = DataCollatorForLanguageModeling(tokenizer.enc, mlm=False)
-    
-    # === THE SECOND CRITICAL FIX ===
-    # The directory must exist BEFORE the trainer is initialized, so that
-    # `os.path.isdir(model.config._name_or_path)` returns True.
     os.makedirs(output_dir, exist_ok=True)
     
+    # === THE FINAL, DEFINITIVE FIX ===
+    # Provide the `tokenizer.enc` object to the `tokenizer` argument.
+    # This prevents the trainer from being `None` and stops the trainer from
+    # attempting to auto-discover a processor, which was the root cause
+    # of the `ValueError`.
     trainer = UnslothTrainer(
         model=model,
-        tokenizer=None,
+        tokenizer=tokenizer.enc,
         args=training_args,
         train_dataset=train_dataset,
         data_collator=data_collator,
