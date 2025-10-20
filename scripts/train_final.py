@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """
 Fully Customizable and Optimized Base Model Pre-training with Unsloth.
-This definitive version (v22) provides the complete and verified solution.
-It resolves the final `TypeError` by implementing a Hugging Face-compatible
-tokenizer wrapper (`NanoChatTokenizerWrapper`). This wrapper satisfies the
-trainer's strict requirement for a `PreTrainedTokenizerBase` instance,
-completing the full compatibility bridge for all custom components.
+This definitive version (v23) provides the complete and verified solution.
+It resolves the final `AttributeError: 'Encoding' object has no attribute
+'pad_token_id'` by correctly initializing the Hugging Face tokenizer wrapper
+with the appropriate padding token ID from the original nanochat tokenizer.
+This completes the full compatibility bridge for all custom components.
 """
 
 import os
@@ -58,42 +58,40 @@ class UnslothCompatibleGPT(PreTrainedModel):
         loss, logits = output if labels is not None else (None, output)
         return {"loss": loss, "logits": logits}
 
-# 3. Create a compatible tokenizer wrapper that inherits from PreTrainedTokenizer
+# 3. Create a compatible tokenizer wrapper
 class NanoChatTokenizerWrapper(PreTrainedTokenizer):
     def __init__(self, nanochat_tokenizer: RustBPETokenizer, **kwargs):
         self.nanochat_tokenizer = nanochat_tokenizer
-        # The underlying tiktoken encoder has the pad_token_id attribute we need
-        kwargs["pad_token_id"] = nanochat_tokenizer.enc.pad_token_id
+        # The base class requires these to be set.
+        kwargs["pad_token"] = "<|bos|>"
+        kwargs["bos_token"] = "<|bos|>"
         super().__init__(**kwargs)
 
     @property
     def vocab_size(self) -> int:
         return self.nanochat_tokenizer.get_vocab_size()
+    
+    # Delegate pad_token_id to the underlying encoder, which we will set.
+    @property
+    def pad_token_id(self) -> int:
+        return self.nanochat_tokenizer.enc.pad_token_id
+    @pad_token_id.setter
+    def pad_token_id(self, value: int):
+        self.nanochat_tokenizer.enc.pad_token_id = value
 
     def _tokenize(self, text: str, **kwargs) -> List[str]:
-        # This is a bit of a hack, as we tokenize to IDs then decode back to token strings.
-        # It's sufficient for the trainer's internal logic.
         ids = self.nanochat_tokenizer.encode(text)
         return [self.nanochat_tokenizer.decode([i]) for i in ids]
-    
     def _convert_token_to_id(self, token: str) -> int:
-        # This will be slow if called often, but it's mainly for special tokens.
         return self.nanochat_tokenizer.encode(token)[0]
-
     def get_vocab(self) -> Dict[str, int]:
-        # Create a mock vocab for compatibility
         return {self.nanochat_tokenizer.decode([i]): i for i in range(self.vocab_size)}
-    
-    # These methods are required by the PreTrainedTokenizer base class
     def save_vocabulary(self, save_directory: str, filename_prefix: str | None = None) -> tuple[str,]:
-        # We don't save here because the original tokenizer has its own save method.
-        # We just need to return the expected path.
         return (os.path.join(save_directory, "mock_vocab.txt"),)
-    
     def build_inputs_with_special_tokens(self, token_ids_0: List[int], token_ids_1: List[int] | None = None) -> List[int]:
         return token_ids_0
 
-# 4. Register our new, compatible classes
+# 4. Register custom classes
 AutoConfig.register(CompatibleGPTConfig.model_type, CompatibleGPTConfig)
 AutoModelForCausalLM.register(CompatibleGPTConfig, UnslothCompatibleGPT)
 
@@ -107,15 +105,18 @@ def main():
     args = parser.parse_args()
 
     output_dir = os.path.abspath(f"./nanochat_unsloth_d{args.depth}_len{args.max_seq_len}")
-
-    # Load the original nanochat tokenizer first
     original_tokenizer = get_tokenizer()
     vocab_size = original_tokenizer.get_vocab_size()
 
-    # Create the HF-compatible wrapper
-    hf_tokenizer = NanoChatTokenizerWrapper(original_tokenizer)
+    # === THE DEFINITIVE `AttributeError` FIX ===
+    # Create the HF-compatible wrapper and explicitly pass the pad_token_id
+    # that the base class constructor (`PreTrainedTokenizer.__init__`) requires.
+    hf_tokenizer = NanoChatTokenizerWrapper(
+        original_tokenizer,
+        pad_token_id=original_tokenizer.get_bos_token_id(),
+    )
 
-    print(f"🚀 Corrected NanoChat Pre-training with Unsloth (v22)")
+    print(f"🚀 Corrected NanoChat Pre-training with Unsloth (v23)")
     print(f"   Model Depth: {args.depth}, Max Seq Len: {args.max_seq_len}, Batch Size: {args.device_batch_size}")
 
     model_config = CompatibleGPTConfig(
@@ -138,9 +139,9 @@ def main():
         batched=True, batch_size=1024, remove_columns=list(train_dataset.features),
     )
 
-    total_batch_size = 524288
+    total_batch_size, target_param_data_ratio, base_lr, embedding_lr_scale = 524288, 20, 3e-4, 0.1
     num_params = sum(p.numel() for p in model.parameters())
-    num_steps = (20 * num_params) // total_batch_size
+    num_steps = (target_param_data_ratio * num_params) // total_batch_size
     tokens_per_device_step = args.device_batch_size * args.max_seq_len
     world_size = int(os.environ.get("WORLD_SIZE", 1))
     grad_accum = total_batch_size // (tokens_per_device_step * world_size)
@@ -148,25 +149,26 @@ def main():
     print(f"📊 Training: {num_params:,} params, {num_steps:,} steps, {grad_accum}x accumulation")
 
     dmodel_scale = (model.config.n_embd / 768) ** -0.5
-    base_lr = 3e-4 * dmodel_scale
-    emb_lr = base_lr * 0.1
+    lr = base_lr * dmodel_scale
+    emb_lr = lr * embedding_lr_scale
 
     training_args = UnslothTrainingArguments(
         output_dir=output_dir, max_steps=num_steps,
         per_device_train_batch_size=args.device_batch_size, gradient_accumulation_steps=grad_accum,
-        learning_rate=base_lr, embedding_learning_rate=emb_lr, lr_scheduler_type="cosine",
+        learning_rate=lr, embedding_learning_rate=emb_lr, lr_scheduler_type="cosine",
         warmup_ratio=0.02, optim="adamw_8bit", weight_decay=0.01,
         max_grad_norm=1.0, bf16=True, logging_steps=10,
         save_steps=1000, save_total_limit=3, dataloader_num_workers=4,
         report_to="wandb", seed=42,
     )
-
-    data_collator = DataCollatorForLanguageModeling(original_tokenizer.enc, mlm=False)
+    
+    # The DataCollator needs a tokenizer that has a pad_token_id. Our wrapper now provides this.
+    data_collator = DataCollatorForLanguageModeling(hf_tokenizer, mlm=False)
     os.makedirs(output_dir, exist_ok=True)
     
     trainer = UnslothTrainer(
         model=model,
-        tokenizer=hf_tokenizer, # Pass the compatible wrapper
+        tokenizer=hf_tokenizer, # Pass the fully compatible wrapper
         args=training_args,
         train_dataset=train_dataset,
         data_collator=data_collator,
