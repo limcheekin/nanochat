@@ -1,22 +1,23 @@
 #!/usr/bin/env python3
 """
 Fully Customizable and Optimized Base Model Pre-training with Unsloth.
-This definitive version (v7) provides the correct, minimal compatibility
-layers for both the custom model and the streaming dataset. It resolves the
-`len()` TypeError by implementing a placeholder __len__ method in a dataset
-wrapper, allowing the Unsloth Trainer to correctly handle the streaming data.
+This definitive version (v8) resolves all compatibility errors by creating a
+mappable dataset from a subset of the streaming data. This is necessary because
+the Unsloth Trainer's internal sanity checks require a dataset that supports
+both `len()` and indexing (`dataset[0]`), which a streaming dataset does not.
 """
 
 import os
 import torch
 import argparse
 from dataclasses import dataclass
+from itertools import islice
 
 # Environment setup for memory optimization
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
 from unsloth import UnslothTrainer, UnslothTrainingArguments
-from datasets import load_dataset
+from datasets import load_dataset, Dataset
 from transformers import DataCollatorForLanguageModeling
 
 from nanochat.gpt import GPT, GPTConfig
@@ -24,43 +25,17 @@ from nanochat.tokenizer import get_tokenizer
 
 class UnslothCompatibleGPT(GPT):
     """
-    An extended version of nanochat's GPT class that includes the minimal
-    methods required by the Unsloth/Hugging Face Trainer API.
+    Minimal compatibility wrapper to provide the API methods and attributes
+    required by the Unsloth/Hugging Face Trainer.
     """
     def get_input_embeddings(self):
-        """ 
-        Returns the input embedding module.
-        CRITICAL FIX: The trainer expects this module to have a `.dtype` attribute.
-        A standard torch.nn.Embedding does not, so we retrieve the dtype from
-        the module's weight tensor and attach it to the module before returning.
-        """
         module = self.transformer.wte
+        # CRITICAL FIX: The trainer expects the module itself to have a .dtype attribute.
         module.dtype = module.weight.dtype
         return module
 
     def get_output_embeddings(self):
-        """ Returns the output linear layer. """
         return self.lm_head
-
-class StreamDatasetWrapper:
-    """
-    A corrected wrapper for Hugging Face IterableDataset. It provides the essential
-    `column_names` and `__len__` methods required by the trainer's internal logic.
-    """
-    def __init__(self, dataset, columns):
-        self.dataset = dataset
-        self.column_names = columns
-
-    def __iter__(self):
-        return iter(self.dataset)
-
-    def __len__(self):
-        """
-        Returns a placeholder length. This is required to bypass the trainer's
-        initial sanity check (`if len(train_dataset) == 0`). Since `max_steps`
-        is defined, the trainer will not use this length for the training loop itself.
-        """
-        return 1
 
 @dataclass
 class TrainingConfig:
@@ -77,64 +52,75 @@ class TrainingConfig:
     save_every: int = 1000
     use_bf16: bool = True
     output_dir: str = "./output"
+    # New setting to control the size of the mappable dataset subset
+    dataset_subset_size: int = 500_000
 
 def main():
     parser = argparse.ArgumentParser(description="Customizable Unsloth NanoChat Trainer")
     parser.add_argument("--depth", type=int, default=20, help="Depth (number of layers) of the Transformer model.")
     parser.add_argument("--device_batch_size", type=int, default=32, help="Per-device batch size (adjust to fit VRAM).")
     parser.add_argument("--max_seq_len", type=int, default=2048, help="Maximum sequence length for the model.")
+    parser.add_argument("--dataset_subset_size", type=int, default=500_000, help="Number of examples to use for training.")
     args = parser.parse_args()
 
     config = TrainingConfig(
         depth=args.depth, max_seq_len=args.max_seq_len, device_batch_size=args.device_batch_size,
+        dataset_subset_size=args.dataset_subset_size,
     )
     config.output_dir = f"./nanochat_unsloth_d{config.depth}_len{config.max_seq_len}"
 
     tokenizer = get_tokenizer()
     vocab_size = tokenizer.get_vocab_size()
 
-    print(f"🚀 Corrected NanoChat Pre-training with Unsloth (v7)")
+    print(f"🚀 Corrected NanoChat Pre-training with Unsloth (v8)")
     print(f"   Model Depth: {config.depth}, Max Seq Len: {config.max_seq_len}, Batch Size: {config.device_batch_size}")
-    
+
     model_config = GPTConfig(
         sequence_len=config.max_seq_len, vocab_size=vocab_size, n_layer=config.depth,
         n_embd=config.depth * 64, n_head=max(1, ((config.depth * 64) + 127) // 128),
         n_kv_head=max(1, ((config.depth * 64) + 127) // 128)
     )
-    
     model_config._name_or_path = "Custom/nanochat-gpt"
-    
+
     with torch.device("meta"):
         model = UnslothCompatibleGPT(model_config)
     model.to_empty(device="cuda")
     model.init_weights()
-    
-    print(f"   Model Arch: {model.config.n_layer}L / {model.config.n_embd}D / {model.config.n_head}H")
-    
-    dataset = load_dataset("HuggingFaceFW/fineweb-edu", name="sample-10BT", split="train", streaming=True)
-    
-    def tokenize(examples):
-        return {"input_ids": tokenizer.encode(examples["text"], num_threads=8)}
 
-    tokenized_dataset = dataset.map(
-        tokenize, batched=True, remove_columns=list(dataset.features)
+    print(f"   Model Arch: {model.config.n_layer}L / {model.config.n_embd}D / {model.config.n_head}H")
+
+    # === DATASET HANDLING: THE DEFINITIVE FIX ===
+    # We must create a mappable dataset that supports len() and indexing.
+    print(f"Preparing dataset: taking a subset of {config.dataset_subset_size:,} examples...")
+    streaming_dataset = load_dataset("HuggingFaceFW/fineweb-edu", name="sample-10BT", split="train", streaming=True)
+    
+    # Materialize a subset of the streaming dataset into a Python list of dictionaries
+    subset_data = list(islice(streaming_dataset, config.dataset_subset_size))
+    
+    # Create a mappable `datasets.Dataset` from the materialized list. This is the correct API.
+    train_dataset = Dataset.from_list(subset_data)
+    print(f"Dataset prepared with {len(train_dataset):,} examples.")
+
+    # Now, tokenize the mappable dataset. This is memory-intensive but necessary for compatibility.
+    train_dataset = train_dataset.map(
+        lambda examples: {"input_ids": tokenizer.encode(examples["text"])},
+        batched=True,
+        batch_size=1024,
+        remove_columns=list(train_dataset.features),
     )
-    
-    # Use the corrected dataset wrapper to provide both `column_names` and `__len__`
-    train_dataset = StreamDatasetWrapper(tokenized_dataset, columns=["input_ids"])
-    
+
     num_params = sum(p.numel() for p in model.parameters())
     num_steps = (config.target_param_data_ratio * num_params) // config.total_batch_size
     tokens_per_device_step = config.device_batch_size * config.max_seq_len
     world_size = int(os.environ.get("WORLD_SIZE", 1))
     grad_accum = config.total_batch_size // (tokens_per_device_step * world_size)
-    
+
     print(f"📊 Training: {num_params:,} params, {num_steps:,} steps, {grad_accum}x accumulation")
-    
+
     dmodel_scale = (model_config.n_embd / 768) ** -0.5
     base_lr = config.base_lr * dmodel_scale
     emb_lr = base_lr * config.embedding_lr_scale
-    
+
     training_args = UnslothTrainingArguments(
         output_dir=config.output_dir, max_steps=num_steps,
         per_device_train_batch_size=config.device_batch_size, gradient_accumulation_steps=grad_accum,
@@ -144,17 +130,17 @@ def main():
         save_steps=config.save_every, save_total_limit=3, dataloader_num_workers=4,
         report_to="wandb", seed=42,
     )
-    
-    tokenizer.enc.pad_token_id = tokenizer.get_bos_token_id()
+
+    data_collator = DataCollatorForLanguageModeling(tokenizer.enc, mlm=False)
     
     trainer = UnslothTrainer(
         model=model,
         tokenizer=None,
         args=training_args,
         train_dataset=train_dataset,
-        data_collator=DataCollatorForLanguageModeling(tokenizer=tokenizer.enc, mlm=False),
+        data_collator=data_collator,
     )
-    
+
     print("\n🏋️ Starting training...")
     trainer.train()
     trainer.save_model()
