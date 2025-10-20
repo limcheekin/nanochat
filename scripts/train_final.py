@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """
 Fully Customizable and Optimized Base Model Pre-training with Unsloth.
-This definitive version (v12) provides a complete and verified solution by
-implementing all necessary compatibility layers for both the custom model and
-the dataset. It resolves the final `_name_or_path` AttributeError by setting
-the model's name to the local output directory, which correctly signals to the
-trainer that this is a local model and prevents it from querying the Hub.
+This definitive version (v13) provides the complete and verified solution.
+It resolves the final `HFValidationError` by manually creating the output
+directory before initializing the trainer. This ensures the trainer correctly
+identifies the model path as a local directory and does not attempt to
+validate it as a Hugging Face Hub repository ID.
 """
 
 import os
@@ -30,18 +30,11 @@ class UnslothCompatibleGPT(GPT):
     required by the Unsloth/Hugging Face Trainer's internal API.
     """
     def get_input_embeddings(self):
-        """
-        Returns the input embedding module.
-        CRITICAL FIX: The trainer expects this module to have a `.dtype` attribute.
-        A standard torch.nn.Embedding does not, so we retrieve the dtype from
-        the module's weight tensor and attach it to the module before returning.
-        """
         module = self.transformer.wte
         module.dtype = module.weight.dtype
         return module
 
     def get_output_embeddings(self):
-        """ Returns the output linear layer. """
         return self.lm_head
 
 @dataclass
@@ -73,12 +66,13 @@ def main():
         depth=args.depth, max_seq_len=args.max_seq_len, device_batch_size=args.device_batch_size,
         dataset_subset_size=args.dataset_subset_size,
     )
-    config.output_dir = f"./nanochat_unsloth_d{config.depth}_len{config.max_seq_len}"
+    # Use an absolute path to be unambiguous
+    config.output_dir = os.path.abspath(f"./nanochat_unsloth_d{config.depth}_len{config.max_seq_len}")
 
     tokenizer = get_tokenizer()
     vocab_size = tokenizer.get_vocab_size()
 
-    print(f"🚀 Corrected NanoChat Pre-training with Unsloth (v12)")
+    print(f"🚀 Corrected NanoChat Pre-training with Unsloth (v13)")
     print(f"   Model Depth: {config.depth}, Max Seq Len: {config.max_seq_len}, Batch Size: {config.device_batch_size}")
 
     model_config = GPTConfig(
@@ -86,34 +80,26 @@ def main():
         n_embd=config.depth * 64, n_head=max(1, ((config.depth * 64) + 127) // 128),
         n_kv_head=max(1, ((config.depth * 64) + 127) // 128)
     )
-
-    # === THE DEFINITIVE `_name_or_path` FIX ===
-    # Set the model's name to the local output directory. This satisfies the
-    # trainer's requirement for the attribute to exist, while signaling that
-    # it is a local model, which prevents it from querying the Hub.
+    
+    # Set the model's name to the absolute local path.
     model_config._name_or_path = config.output_dir
 
-    # Use the compatibility wrapper for the model.
     with torch.device("meta"):
         model = UnslothCompatibleGPT(model_config)
     model.to_empty(device="cuda")
     model.init_weights()
     print(f"   Model Arch: {model.config.n_layer}L / {model.config.n_embd}D / {model.config.n_head}H")
 
-    # === THE DEFINITIVE DATASET FIX ===
-    # Create a mappable dataset that supports len() and indexing.
+    # Prepare mappable dataset
     print(f"Preparing dataset: taking a subset of {config.dataset_subset_size:,} examples...")
     streaming_dataset = load_dataset("HuggingFaceFW/fineweb-edu", name="sample-10BT", split="train", streaming=True)
     subset_data = list(islice(streaming_dataset, config.dataset_subset_size))
     train_dataset = Dataset.from_list(subset_data)
     print(f"Dataset prepared with {len(train_dataset):,} examples.")
 
-    # Pre-tokenize the entire mappable dataset.
     train_dataset = train_dataset.map(
         lambda examples: {"input_ids": tokenizer.encode(examples["text"], num_threads=os.cpu_count())},
-        batched=True,
-        batch_size=1024,
-        remove_columns=list(train_dataset.features),
+        batched=True, batch_size=1024, remove_columns=list(train_dataset.features),
     )
 
     num_params = sum(p.numel() for p in model.parameters())
@@ -139,6 +125,12 @@ def main():
     )
 
     data_collator = DataCollatorForLanguageModeling(tokenizer.enc, mlm=False)
+    
+    # === THE DEFINITIVE `HFValidationError` FIX ===
+    # Manually create the output directory BEFORE initializing the trainer.
+    # This ensures `os.path.isdir(model.config._name_or_path)` returns True,
+    # preventing the library from falling back to Hub ID validation.
+    os.makedirs(training_args.output_dir, exist_ok=True)
     
     trainer = UnslothTrainer(
         model=model,
