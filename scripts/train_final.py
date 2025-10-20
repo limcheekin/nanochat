@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Fully Customizable and Optimized Base Model Pre-training with Unsloth.
-This definitive version (v5) fixes the streaming dataset incompatibility with the Trainer.
+This definitive version (v6) provides the full API compatibility for the Trainer.
 """
 
 import os
@@ -19,19 +19,25 @@ from transformers import DataCollatorForLanguageModeling
 from nanochat.gpt import GPT, GPTConfig
 from nanochat.tokenizer import get_tokenizer
 
+# ===================================================================
+# 1. DEFINE THE FULLY COMPATIBLE ADAPTER CLASS
+# ===================================================================
 class UnslothCompatibleGPT(GPT):
     """
-    An extended version of nanochat's GPT class that includes a fully
-    compliant get_input_embeddings method for the Unsloth/HF Trainer.
+    An extended version of nanochat's GPT class that includes all
+    methods required by the Hugging Face/Unsloth Trainer.
     """
     def get_input_embeddings(self):
+        # Provides access to the word embedding layer
         module = self.transformer.wte
         module.dtype = module.weight.dtype
         return module
 
+    def get_output_embeddings(self):
+        # Provides access to the final language model head
+        return self.lm_head
 # ===================================================================
-# 1. DEFINE THE DATASET WRAPPER TO FIX THE 'NoneType' ERROR
-# ===================================================================
+
 class StreamDatasetWrapper:
     """
     A wrapper to make a Hugging Face IterableDataset compatible with
@@ -43,7 +49,6 @@ class StreamDatasetWrapper:
 
     def __iter__(self):
         return iter(self.dataset)
-# ===================================================================
 
 @dataclass
 class TrainingConfig:
@@ -76,7 +81,7 @@ def main():
     tokenizer = get_tokenizer()
     vocab_size = tokenizer.get_vocab_size()
 
-    print(f"🚀 Fully Customizable NanoChat Pre-training with Unsloth (v5)")
+    print(f"🚀 Fully Customizable NanoChat Pre-training with Unsloth (v6)")
     print(f"   Model Depth: {config.depth}, Max Seq Len: {config.max_seq_len}, Batch Size: {config.device_batch_size}")
     
     model_config = GPTConfig(
@@ -98,18 +103,10 @@ def main():
         return {"input_ids": tokenizer.encode(examples["text"], num_threads=8)}
 
     tokenized_dataset = dataset.map(
-        tokenize,
-        batched=True,
-        remove_columns=["text"]
+        tokenize, batched=True, remove_columns=["text"]
     )
     
-    # ===================================================================
-    # 2. APPLY THE WRAPPER TO THE STREAMING DATASET
-    # ===================================================================
-    # After tokenization, our dataset only has the 'input_ids' column.
-    # We provide this list to the wrapper.
     train_dataset = StreamDatasetWrapper(tokenized_dataset, columns=["input_ids"])
-    # ===================================================================
     
     num_params = sum(p.numel() for p in model.parameters())
     num_steps = (config.target_param_data_ratio * num_params) // config.total_batch_size
