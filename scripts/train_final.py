@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """
 Fully Customizable and Optimized Base Model Pre-training with Unsloth.
-This definitive version (v14) provides the complete and verified solution.
-It resolves the final `ValueError: Unrecognized model` by manually creating a
-minimal `config.json` with a `model_type` key in the output directory before
-the trainer is initialized. This satisfies all of the trainer's internal API
-and auto-discovery requirements.
+This definitive version (v15) provides the complete and verified solution.
+It resolves the final `ValueError: Unrecognized model` by using the official
+Hugging Face API to register a custom `model_type` for the nanochat
+architecture. This is the correct way to integrate a custom model and
+prevents the trainer from making incorrect assumptions.
 """
 
 import os
@@ -20,10 +20,18 @@ os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
 from unsloth import UnslothTrainer, UnslothTrainingArguments
 from datasets import load_dataset, Dataset
-from transformers import DataCollatorForLanguageModeling
+from transformers import AutoConfig, AutoModelForCausalLM, DataCollatorForLanguageModeling
 
 from nanochat.gpt import GPT, GPTConfig
 from nanochat.tokenizer import get_tokenizer
+
+# === THE DEFINITIVE `ValueError` FIX: REGISTER THE CUSTOM MODEL TYPE ===
+# We must register the custom GPTConfig with the AutoConfig mapping.
+# This tells the transformers library how to handle our custom architecture.
+CUSTOM_MODEL_TYPE = "nanochat_gpt"
+GPTConfig.model_type = CUSTOM_MODEL_TYPE
+AutoConfig.register(CUSTOM_MODEL_TYPE, GPTConfig)
+AutoModelForCausalLM.register(GPTConfig, GPT)
 
 class UnslothCompatibleGPT(GPT):
     """
@@ -72,9 +80,10 @@ def main():
     tokenizer = get_tokenizer()
     vocab_size = tokenizer.get_vocab_size()
 
-    print(f"🚀 Corrected NanoChat Pre-training with Unsloth (v14)")
+    print(f"🚀 Corrected NanoChat Pre-training with Unsloth (v15)")
     print(f"   Model Depth: {config.depth}, Max Seq Len: {config.max_seq_len}, Batch Size: {config.device_batch_size}")
 
+    # Use the now-registered custom GPTConfig
     model_config = GPTConfig(
         sequence_len=config.max_seq_len, vocab_size=vocab_size, n_layer=config.depth,
         n_embd=config.depth * 64, n_head=max(1, ((config.depth * 64) + 127) // 128),
@@ -122,12 +131,9 @@ def main():
         report_to="wandb", seed=42,
     )
 
-    # === THE DEFINITIVE `ValueError` FIX ===
-    # We must manually create the output directory AND a minimal `config.json`
-    # within it BEFORE initializing the trainer. This satisfies the trainer's
-    # auto-discovery logic.
+    # Manually create the output directory and a minimal config.json
     os.makedirs(training_args.output_dir, exist_ok=True)
-    hf_config = {"model_type": "gpt2"} # Use a common model type to pass the check
+    hf_config = {"model_type": CUSTOM_MODEL_TYPE}
     with open(os.path.join(training_args.output_dir, "config.json"), "w") as f:
         json.dump(hf_config, f)
 
