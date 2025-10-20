@@ -147,8 +147,7 @@ def main():
         max_grad_norm=1.0, bf16=True, logging_steps=10,
         save_steps=1000, save_total_limit=3, dataloader_num_workers=4,
         report_to="wandb", seed=42,
-        # The trainer enables this by default if it is supported
-        # gradient_checkpointing = True, 
+        gradient_checkpointing = True, # The trainer enables this by default if it is supported
     )
     
     data_collator = DataCollatorForLanguageModeling(hf_tokenizer, mlm=False)
