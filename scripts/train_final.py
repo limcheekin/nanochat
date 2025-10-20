@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Fully Customizable and Optimized Base Model Pre-training with Unsloth.
-This is the definitive script to resolve the TypeError.
+This is the definitive script that uses the modern Unsloth API.
 """
 
 import os
@@ -59,8 +59,6 @@ def main():
     print(f"   Max Sequence Length: {config.max_seq_len}")
     print(f"   Device Batch Size: {config.device_batch_size}")
     
-    # --- Correct Model Initialization Flow ---
-    # 1. Define the model configuration
     model_config = GPTConfig(
         sequence_len=config.max_seq_len,
         vocab_size=vocab_size,
@@ -70,7 +68,6 @@ def main():
         n_kv_head=max(1, ((config.depth * 64) + 127) // 128)
     )
     
-    # 2. Instantiate the base torch module
     with torch.device("meta"):
         base_model = GPT(model_config)
     model = base_model.to_empty(device="cuda")
@@ -78,11 +75,17 @@ def main():
     
     print(f"   Model Arch: {model_config.n_layer}L / {model_config.n_embd}D / {model_config.n_head}H")
 
-    # 3. Wrap the torch module with the Unsloth class.
-    #    The variable `FastLanguageModel` remains the class, and the resulting
-    #    object is correctly assigned to the `model` variable.
-    model = FastLanguageModel(model)
-    # --- End of Correct Flow ---
+    # ========================== THE ONLY CHANGE IS HERE ==========================
+    # Old, incorrect line:
+    # model = FastLanguageModel(model)
+    # New, correct line using the from_pretrained factory method:
+    model, tokenizer = FastLanguageModel.from_pretrained(
+        model = model,
+        tokenizer = tokenizer,
+        max_seq_len = config.max_seq_len,
+        dtype = torch.bfloat16 if config.use_bf16 else torch.float32,
+    )
+    # ===========================================================================
     
     dataset = load_dataset("HuggingFaceFW/fineweb-edu", name="sample-10BT", split="train", streaming=True)
     
@@ -124,14 +127,15 @@ def main():
         seed=42,
     )
     
-    tokenizer.enc.pad_token_id = tokenizer.get_bos_token_id()
+    # We pass the tokenizer returned by Unsloth to the collator
+    data_collator = DataCollatorForLanguageModeling(tokenizer=tokenizer, mlm=False)
     
     trainer = UnslothTrainer(
         model=model,
         tokenizer=None,
         args=training_args,
         train_dataset=train_dataset,
-        data_collator=DataCollatorForLanguageModeling(tokenizer=tokenizer.enc, mlm=False),
+        data_collator=data_collator,
     )
     
     print("\n🏋️ Starting training...")
