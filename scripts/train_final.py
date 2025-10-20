@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Fully Customizable and Optimized Base Model Pre-training with Unsloth.
-This definitive version uses a non-invasive extension of the GPT class.
+This definitive version (v4) fixes the streaming dataset incompatibility.
 """
 
 import os
@@ -16,27 +16,18 @@ from unsloth import UnslothTrainer, UnslothTrainingArguments
 from datasets import load_dataset
 from transformers import DataCollatorForLanguageModeling
 
-# Import the original GPT class and its config
 from nanochat.gpt import GPT, GPTConfig
 from nanochat.tokenizer import get_tokenizer
 
-# ===================================================================
-# 1. DEFINE THE EXTENDED, COMPATIBLE GPT CLASS (NON-INVASIVE)
-# ===================================================================
 class UnslothCompatibleGPT(GPT):
     """
     An extended version of nanochat's GPT class that includes a fully
     compliant get_input_embeddings method for the Unsloth/HF Trainer.
     """
     def get_input_embeddings(self):
-        # The Unsloth trainer expects the returned module to have a .dtype attribute.
-        # A standard nn.Embedding module doesn't, so we dynamically add it.
-        # This is the final compatibility fix.
         module = self.transformer.wte
         module.dtype = module.weight.dtype
         return module
-
-# ===================================================================
 
 @dataclass
 class TrainingConfig:
@@ -69,7 +60,7 @@ def main():
     tokenizer = get_tokenizer()
     vocab_size = tokenizer.get_vocab_size()
 
-    print(f"🚀 Fully Customizable NanoChat Pre-training with Unsloth")
+    print(f"🚀 Fully Customizable NanoChat Pre-training with Unsloth (v4)")
     print(f"   Model Depth: {config.depth}, Max Seq Len: {config.max_seq_len}, Batch Size: {config.device_batch_size}")
     
     model_config = GPTConfig(
@@ -78,14 +69,10 @@ def main():
         n_kv_head=max(1, ((config.depth * 64) + 127) // 128)
     )
     
-    # ===================================================================
-    # 2. INSTANTIATE THE NEW, EXTENDED CLASS
-    # ===================================================================
     with torch.device("meta"):
         model = UnslothCompatibleGPT(model_config)
     model.to_empty(device="cuda")
     model.init_weights()
-    # ===================================================================
     
     print(f"   Model Arch: {model.config.n_layer}L / {model.config.n_embd}D / {model.config.n_head}H")
     
@@ -94,7 +81,16 @@ def main():
     def tokenize(examples):
         return {"input_ids": tokenizer.encode(examples["text"], num_threads=8)}
 
-    train_dataset = dataset.map(tokenize, batched=True)
+    # ========================== THE FINAL CHANGE IS HERE ==========================
+    # We explicitly remove the original "text" column after tokenization.
+    # This creates a clean, iterable dataset containing only `input_ids`,
+    # which satisfies the Unsloth Trainer's internal checks.
+    train_dataset = dataset.map(
+        tokenize,
+        batched=True,
+        remove_columns=["text"] # This is the critical fix
+    )
+    # ============================================================================
     
     num_params = sum(p.numel() for p in model.parameters())
     num_steps = (config.target_param_data_ratio * num_params) // config.total_batch_size
