@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """
 Fully Customizable and Optimized Base Model Pre-training with Unsloth.
-This definitive version (v2) correctly implements the necessary compatibility
-layers for using a custom torch.nn.Module with the Unsloth/HF Trainer.
+This definitive version (v3) provides the correct, minimal compatibility
+layers to interface nanochat's custom GPT model with the Unsloth Trainer,
+resolving all API incompatibilities.
 """
 
 import os
@@ -22,23 +23,32 @@ from nanochat.tokenizer import get_tokenizer
 
 class UnslothCompatibleGPT(GPT):
     """
-    An extended version of nanochat's GPT class that includes all
-    methods required by the Hugging Face/Unsloth Trainer. This is the
-    correct way to add the necessary API interface.
+    An extended version of nanochat's GPT class that includes all methods
+    and attributes required by the Hugging Face/Unsloth Trainer.
     """
     def get_input_embeddings(self):
-        # The trainer needs this to determine the input embedding layer
-        return self.transformer.wte
+        """
+        Returns the input embedding module.
+        CRITICAL FIX: The trainer expects this module to have a `.dtype` attribute.
+        A standard torch.nn.Embedding does not, so we retrieve the dtype from
+        the module's weight tensor and attach it to the module before returning.
+        """
+        module = self.transformer.wte
+        # Attach the dtype from the weight parameter to the module itself
+        module.dtype = module.weight.dtype
+        return module
 
     def get_output_embeddings(self):
-        # The trainer needs this for features like `embedding_learning_rate`
+        """
+        Returns the output linear layer. This is required for features
+        like `embedding_learning_rate` to apply to the LM head.
+        """
         return self.lm_head
 
 class StreamDatasetWrapper:
     """
     A wrapper to make a Hugging Face IterableDataset compatible with
-    the SFT Trainer by explicitly providing a `column_names` attribute,
-    which the trainer requires for processing.
+    the SFT Trainer by explicitly providing a `column_names` attribute.
     """
     def __init__(self, dataset, columns):
         self.dataset = dataset
@@ -78,7 +88,7 @@ def main():
     tokenizer = get_tokenizer()
     vocab_size = tokenizer.get_vocab_size()
 
-    print(f"🚀 Corrected NanoChat Pre-training with Unsloth (v2)")
+    print(f"🚀 Corrected NanoChat Pre-training with Unsloth (v3)")
     print(f"   Model Depth: {config.depth}, Max Seq Len: {config.max_seq_len}, Batch Size: {config.device_batch_size}")
     
     model_config = GPTConfig(
@@ -87,12 +97,10 @@ def main():
         n_kv_head=max(1, ((config.depth * 64) + 127) // 128)
     )
     
-    # === NECESSARY PATCH ===
-    # The Unsloth/SFT Trainer checks for this attribute to identify the model.
-    # We must add it to prevent errors and ensure it's treated as a custom model.
+    # The trainer requires this attribute to identify the model.
     model_config._name_or_path = "Custom/nanochat-gpt"
     
-    # Use the compatible wrapper that has the required methods
+    # Use the compatible wrapper with the dtype fix
     with torch.device("meta"):
         model = UnslothCompatibleGPT(model_config)
     model.to_empty(device="cuda")
@@ -105,12 +113,12 @@ def main():
     def tokenize(examples):
         return {"input_ids": tokenizer.encode(examples["text"], num_threads=8)}
 
-    # We must remove the original columns to avoid conflicts with the trainer
+    # Remove original columns to prevent conflicts. The trainer only needs `input_ids`.
     tokenized_dataset = dataset.map(
-        tokenize, batched=True, remove_columns=["text", "dump", "url"]
+        tokenize, batched=True, remove_columns=list(dataset.features)
     )
     
-    # Use the dataset wrapper to provide the column_names attribute
+    # Use the dataset wrapper to provide the required `column_names` attribute
     train_dataset = StreamDatasetWrapper(tokenized_dataset, columns=["input_ids"])
     
     num_params = sum(p.numel() for p in model.parameters())
