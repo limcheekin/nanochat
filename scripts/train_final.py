@@ -25,11 +25,17 @@ from nanochat.tokenizer import get_tokenizer
 # ===================================================================
 class UnslothCompatibleGPT(GPT):
     """
-    An extended version of nanochat's GPT class that includes the
-    get_input_embeddings method required by the Hugging Face/Unsloth Trainer.
+    An extended version of nanochat's GPT class that includes a fully
+    compliant get_input_embeddings method for the Unsloth/HF Trainer.
     """
     def get_input_embeddings(self):
-        return self.transformer.wte
+        # The Unsloth trainer expects the returned module to have a .dtype attribute.
+        # A standard nn.Embedding module doesn't, so we dynamically add it.
+        # This is the final compatibility fix.
+        module = self.transformer.wte
+        module.dtype = module.weight.dtype
+        return module
+
 # ===================================================================
 
 @dataclass
