@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """
 Fully Customizable and Optimized Base Model Pre-training with Unsloth.
-This definitive version (v5) uses a corrected, minimal compatibility layer
-for both the custom model and the streaming dataset, resolving all previously
-encountered API incompatibilities with the Unsloth Trainer.
+This definitive version (v6) resolves all compatibility errors by using a
+mappable dataset instead of a streaming dataset, which is required by the
+Unsloth Trainer's internal checks. This ensures the `len()` function can be
+called on the dataset, fixing the persistent TypeError.
 """
 
 import os
@@ -15,7 +16,7 @@ from dataclasses import dataclass
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
 from unsloth import UnslothTrainer, UnslothTrainingArguments
-from datasets import load_dataset
+from datasets import load_dataset, IterableDataset
 from transformers import DataCollatorForLanguageModeling
 
 from nanochat.gpt import GPT, GPTConfig
@@ -24,10 +25,10 @@ from nanochat.tokenizer import get_tokenizer
 class UnslothCompatibleGPT(GPT):
     """
     An extended version of nanochat's GPT class that includes the minimal
-    methods and attributes required by the Unsloth/Hugging Face Trainer API.
+    methods required by the Unsloth/Hugging Face Trainer API.
     """
     def get_input_embeddings(self):
-        """
+        """ 
         Returns the input embedding module.
         CRITICAL FIX: The trainer expects this module to have a `.dtype` attribute.
         A standard torch.nn.Embedding does not, so we retrieve the dtype from
@@ -40,19 +41,6 @@ class UnslothCompatibleGPT(GPT):
     def get_output_embeddings(self):
         """ Returns the output linear layer. """
         return self.lm_head
-
-class StreamDatasetWrapper:
-    """
-    A corrected wrapper for Hugging Face IterableDataset.
-    It provides the essential `column_names` attribute required by the trainer's
-    internal logic, which is the fix for the `TypeError: argument of type 'NoneType' is not iterable`.
-    """
-    def __init__(self, dataset, columns):
-        self.dataset = dataset
-        self.column_names = columns
-
-    def __iter__(self):
-        return iter(self.dataset)
 
 @dataclass
 class TrainingConfig:
@@ -69,23 +57,27 @@ class TrainingConfig:
     save_every: int = 1000
     use_bf16: bool = True
     output_dir: str = "./output"
+    # New setting for dataset handling
+    dataset_subset_size: int = 1_000_000 # Number of samples to take for the mappable dataset
 
 def main():
     parser = argparse.ArgumentParser(description="Customizable Unsloth NanoChat Trainer")
     parser.add_argument("--depth", type=int, default=20, help="Depth (number of layers) of the Transformer model.")
     parser.add_argument("--device_batch_size", type=int, default=32, help="Per-device batch size (adjust to fit VRAM).")
     parser.add_argument("--max_seq_len", type=int, default=2048, help="Maximum sequence length for the model.")
+    parser.add_argument("--dataset_subset_size", type=int, default=1_000_000, help="Number of examples to use from the dataset.")
     args = parser.parse_args()
 
     config = TrainingConfig(
         depth=args.depth, max_seq_len=args.max_seq_len, device_batch_size=args.device_batch_size,
+        dataset_subset_size=args.dataset_subset_size,
     )
     config.output_dir = f"./nanochat_unsloth_d{config.depth}_len{config.max_seq_len}"
 
     tokenizer = get_tokenizer()
     vocab_size = tokenizer.get_vocab_size()
 
-    print(f"🚀 Corrected NanoChat Pre-training with Unsloth (v5)")
+    print(f"🚀 Corrected NanoChat Pre-training with Unsloth (v6)")
     print(f"   Model Depth: {config.depth}, Max Seq Len: {config.max_seq_len}, Batch Size: {config.device_batch_size}")
 
     model_config = GPTConfig(
@@ -103,18 +95,31 @@ def main():
 
     print(f"   Model Arch: {model.config.n_layer}L / {model.config.n_embd}D / {model.config.n_head}H")
 
-    dataset = load_dataset("HuggingFaceFW/fineweb-edu", name="sample-10BT", split="train", streaming=True)
+    # === DATASET HANDLING FIX ===
+    # Load the dataset in streaming mode first to take a subset,
+    # then convert it to a mappable dataset which has a __len__ method.
+    print(f"Preparing dataset: taking a subset of {config.dataset_subset_size:,} examples...")
+    streaming_dataset = load_dataset("HuggingFaceFW/fineweb-edu", name="sample-10BT", split="train", streaming=True)
+    
+    # Take a subset and convert to a mappable format by forcing it through a generator.
+    subset_generator = (ex for ex in streaming_dataset.take(config.dataset_subset_size))
+    train_dataset = dataset = load_dataset("json", f=subset_generator)
+
+    print(f"Dataset prepared with {len(train_dataset):,} examples.")
 
     def tokenize(examples):
-        return {"input_ids": tokenizer.encode(examples["text"], num_threads=8)}
+        # We manually handle tokenization to match nanochat's logic.
+        # This function will not be used with `map`, but is kept for reference.
+        return tokenizer(examples["text"], truncation=True, max_length=config.max_seq_len)
 
-    # Tokenize and remove original columns. The trainer only needs `input_ids`.
-    tokenized_dataset = dataset.map(
-        tokenize, batched=True, remove_columns=list(dataset.features)
+    # We pre-tokenize the entire mappable dataset.
+    # Note: This is memory-intensive but necessary for compatibility.
+    train_dataset = train_dataset.map(
+        lambda examples: {"input_ids": tokenizer.encode(examples["text"])},
+        batched=True,
+        batch_size=1024,
+        remove_columns=list(train_dataset.features),
     )
-
-    # Use the corrected dataset wrapper to provide the `column_names` attribute.
-    train_dataset = StreamDatasetWrapper(tokenized_dataset, columns=["input_ids"])
 
     num_params = sum(p.numel() for p in model.parameters())
     num_steps = (config.target_param_data_ratio * num_params) // config.total_batch_size
@@ -138,14 +143,14 @@ def main():
         report_to="wandb", seed=42,
     )
 
-    tokenizer.enc.pad_token_id = tokenizer.get_bos_token_id()
-
+    data_collator = DataCollatorForLanguageModeling(tokenizer.enc, mlm=False)
+    
     trainer = UnslothTrainer(
         model=model,
         tokenizer=None,
         args=training_args,
         train_dataset=train_dataset,
-        data_collator=DataCollatorForLanguageModeling(tokenizer=tokenizer.enc, mlm=False),
+        data_collator=data_collator,
     )
 
     print("\n🏋️ Starting training...")
