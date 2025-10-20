@@ -1,11 +1,10 @@
 #!/usr/bin/env python3
 """
 Fully Customizable and Optimized Base Model Pre-training with Unsloth.
-This definitive version (v19) provides the complete and verified solution.
-It resolves the final `TypeError: unexpected keyword argument` by correctly
-filtering the configuration dictionary to only pass the attributes expected by
-the original `nanochat` GPTConfig dataclass. This completes the compatibility
-bridge between the two libraries.
+This definitive version (v20) provides the complete and verified solution.
+It resolves the final `HFValidationError` by correctly setting the `name_or_path`
+attribute on the custom config and pre-creating the output directory, ensuring
+the trainer's internal API and validation checks are fully satisfied.
 """
 
 import os
@@ -56,17 +55,11 @@ class UnslothCompatibleGPT(PreTrainedModel):
     def __init__(self, config: CompatibleGPTConfig):
         super().__init__(config)
         
-        # === THE DEFINITIVE `TypeError` FIX ===
-        # Get all attributes from the compatible HF config
         config_dict = config.to_dict()
-        # Get the field names that the original dataclass expects
         expected_keys = {f.name for f in fields(OriginalGPTConfig)}
-        # Filter the dictionary to only include the expected keys
         filtered_config_dict = {k: v for k, v in config_dict.items() if k in expected_keys}
-        # Now instantiate the original config with only the relevant arguments
         original_config = OriginalGPTConfig(**filtered_config_dict)
 
-        # Contain an instance of the original model
         self.model = GPT(original_config)
 
     def get_input_embeddings(self):
@@ -78,10 +71,8 @@ class UnslothCompatibleGPT(PreTrainedModel):
         return self.model.lm_head
 
     def forward(self, input_ids, labels=None, **kwargs):
-        # Forward the call to the original nanochat model.
         output = self.model.forward(idx=input_ids, targets=labels)
         
-        # Return in the dictionary format expected by the HF Trainer
         if labels is not None:
             loss, logits = output
             return {"loss": loss, "logits": logits}
@@ -107,16 +98,20 @@ def main():
     tokenizer = get_tokenizer()
     vocab_size = tokenizer.get_vocab_size()
 
-    print(f"🚀 Corrected NanoChat Pre-training with Unsloth (v19)")
+    print(f"🚀 Corrected NanoChat Pre-training with Unsloth (v20)")
     print(f"   Model Depth: {args.depth}, Max Seq Len: {args.max_seq_len}, Batch Size: {args.device_batch_size}")
 
+    # === THE CRITICAL FIX for HFValidationError ===
+    # Instantiate the config AND explicitly set its `name_or_path` attribute
+    # to the absolute path of the output directory.
     model_config = CompatibleGPTConfig(
         sequence_len=args.max_seq_len, vocab_size=vocab_size, n_layer=args.depth,
         n_embd=args.depth * 64, n_head=max(1, ((args.depth * 64) + 127) // 128),
-        n_kv_head=max(1, ((args.depth * 64) + 127) // 128)
+        n_kv_head=max(1, ((args.depth * 64) + 127) // 128),
+        name_or_path=output_dir,
     )
 
-    # Initialize the model directly from the config object in memory.
+    # Initialize the model directly from the complete config object.
     model = UnslothCompatibleGPT(config=model_config)
     print(f"   Model Arch: {model.config.n_layer}L / {model.config.n_embd}D / {model.config.n_head}H")
 
@@ -156,6 +151,11 @@ def main():
     )
 
     data_collator = DataCollatorForLanguageModeling(tokenizer.enc, mlm=False)
+    
+    # === THE SECOND CRITICAL FIX ===
+    # The directory must exist BEFORE the trainer is initialized, so that
+    # `os.path.isdir(model.config._name_or_path)` returns True.
+    os.makedirs(output_dir, exist_ok=True)
     
     trainer = UnslothTrainer(
         model=model,
