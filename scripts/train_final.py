@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """
 Fully Customizable and Optimized Base Model Pre-training with Unsloth.
-This definitive version (v6) resolves all compatibility errors by using a
-mappable dataset instead of a streaming dataset, which is required by the
-Unsloth Trainer's internal checks. This ensures the `len()` function can be
-called on the dataset, fixing the persistent TypeError.
+This definitive version (v7) provides the correct, minimal compatibility
+layers for both the custom model and the streaming dataset. It resolves the
+`len()` TypeError by implementing a placeholder __len__ method in a dataset
+wrapper, allowing the Unsloth Trainer to correctly handle the streaming data.
 """
 
 import os
@@ -16,7 +16,7 @@ from dataclasses import dataclass
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
 from unsloth import UnslothTrainer, UnslothTrainingArguments
-from datasets import load_dataset, IterableDataset
+from datasets import load_dataset
 from transformers import DataCollatorForLanguageModeling
 
 from nanochat.gpt import GPT, GPTConfig
@@ -42,6 +42,26 @@ class UnslothCompatibleGPT(GPT):
         """ Returns the output linear layer. """
         return self.lm_head
 
+class StreamDatasetWrapper:
+    """
+    A corrected wrapper for Hugging Face IterableDataset. It provides the essential
+    `column_names` and `__len__` methods required by the trainer's internal logic.
+    """
+    def __init__(self, dataset, columns):
+        self.dataset = dataset
+        self.column_names = columns
+
+    def __iter__(self):
+        return iter(self.dataset)
+
+    def __len__(self):
+        """
+        Returns a placeholder length. This is required to bypass the trainer's
+        initial sanity check (`if len(train_dataset) == 0`). Since `max_steps`
+        is defined, the trainer will not use this length for the training loop itself.
+        """
+        return 1
+
 @dataclass
 class TrainingConfig:
     depth: int = 20
@@ -57,82 +77,64 @@ class TrainingConfig:
     save_every: int = 1000
     use_bf16: bool = True
     output_dir: str = "./output"
-    # New setting for dataset handling
-    dataset_subset_size: int = 1_000_000 # Number of samples to take for the mappable dataset
 
 def main():
     parser = argparse.ArgumentParser(description="Customizable Unsloth NanoChat Trainer")
     parser.add_argument("--depth", type=int, default=20, help="Depth (number of layers) of the Transformer model.")
     parser.add_argument("--device_batch_size", type=int, default=32, help="Per-device batch size (adjust to fit VRAM).")
     parser.add_argument("--max_seq_len", type=int, default=2048, help="Maximum sequence length for the model.")
-    parser.add_argument("--dataset_subset_size", type=int, default=1_000_000, help="Number of examples to use from the dataset.")
     args = parser.parse_args()
 
     config = TrainingConfig(
         depth=args.depth, max_seq_len=args.max_seq_len, device_batch_size=args.device_batch_size,
-        dataset_subset_size=args.dataset_subset_size,
     )
     config.output_dir = f"./nanochat_unsloth_d{config.depth}_len{config.max_seq_len}"
 
     tokenizer = get_tokenizer()
     vocab_size = tokenizer.get_vocab_size()
 
-    print(f"🚀 Corrected NanoChat Pre-training with Unsloth (v6)")
+    print(f"🚀 Corrected NanoChat Pre-training with Unsloth (v7)")
     print(f"   Model Depth: {config.depth}, Max Seq Len: {config.max_seq_len}, Batch Size: {config.device_batch_size}")
-
+    
     model_config = GPTConfig(
         sequence_len=config.max_seq_len, vocab_size=vocab_size, n_layer=config.depth,
         n_embd=config.depth * 64, n_head=max(1, ((config.depth * 64) + 127) // 128),
         n_kv_head=max(1, ((config.depth * 64) + 127) // 128)
     )
-
+    
     model_config._name_or_path = "Custom/nanochat-gpt"
-
+    
     with torch.device("meta"):
         model = UnslothCompatibleGPT(model_config)
     model.to_empty(device="cuda")
     model.init_weights()
-
-    print(f"   Model Arch: {model.config.n_layer}L / {model.config.n_embd}D / {model.config.n_head}H")
-
-    # === DATASET HANDLING FIX ===
-    # Load the dataset in streaming mode first to take a subset,
-    # then convert it to a mappable dataset which has a __len__ method.
-    print(f"Preparing dataset: taking a subset of {config.dataset_subset_size:,} examples...")
-    streaming_dataset = load_dataset("HuggingFaceFW/fineweb-edu", name="sample-10BT", split="train", streaming=True)
     
-    # Take a subset and convert to a mappable format by forcing it through a generator.
-    subset_generator = (ex for ex in streaming_dataset.take(config.dataset_subset_size))
-    train_dataset = dataset = load_dataset("json", f=subset_generator)
-
-    print(f"Dataset prepared with {len(train_dataset):,} examples.")
-
+    print(f"   Model Arch: {model.config.n_layer}L / {model.config.n_embd}D / {model.config.n_head}H")
+    
+    dataset = load_dataset("HuggingFaceFW/fineweb-edu", name="sample-10BT", split="train", streaming=True)
+    
     def tokenize(examples):
-        # We manually handle tokenization to match nanochat's logic.
-        # This function will not be used with `map`, but is kept for reference.
-        return tokenizer(examples["text"], truncation=True, max_length=config.max_seq_len)
+        return {"input_ids": tokenizer.encode(examples["text"], num_threads=8)}
 
-    # We pre-tokenize the entire mappable dataset.
-    # Note: This is memory-intensive but necessary for compatibility.
-    train_dataset = train_dataset.map(
-        lambda examples: {"input_ids": tokenizer.encode(examples["text"])},
-        batched=True,
-        batch_size=1024,
-        remove_columns=list(train_dataset.features),
+    tokenized_dataset = dataset.map(
+        tokenize, batched=True, remove_columns=list(dataset.features)
     )
-
+    
+    # Use the corrected dataset wrapper to provide both `column_names` and `__len__`
+    train_dataset = StreamDatasetWrapper(tokenized_dataset, columns=["input_ids"])
+    
     num_params = sum(p.numel() for p in model.parameters())
     num_steps = (config.target_param_data_ratio * num_params) // config.total_batch_size
     tokens_per_device_step = config.device_batch_size * config.max_seq_len
     world_size = int(os.environ.get("WORLD_SIZE", 1))
     grad_accum = config.total_batch_size // (tokens_per_device_step * world_size)
-
+    
     print(f"📊 Training: {num_params:,} params, {num_steps:,} steps, {grad_accum}x accumulation")
-
+    
     dmodel_scale = (model_config.n_embd / 768) ** -0.5
     base_lr = config.base_lr * dmodel_scale
     emb_lr = base_lr * config.embedding_lr_scale
-
+    
     training_args = UnslothTrainingArguments(
         output_dir=config.output_dir, max_steps=num_steps,
         per_device_train_batch_size=config.device_batch_size, gradient_accumulation_steps=grad_accum,
@@ -142,17 +144,17 @@ def main():
         save_steps=config.save_every, save_total_limit=3, dataloader_num_workers=4,
         report_to="wandb", seed=42,
     )
-
-    data_collator = DataCollatorForLanguageModeling(tokenizer.enc, mlm=False)
+    
+    tokenizer.enc.pad_token_id = tokenizer.get_bos_token_id()
     
     trainer = UnslothTrainer(
         model=model,
         tokenizer=None,
         args=training_args,
         train_dataset=train_dataset,
-        data_collator=data_collator,
+        data_collator=DataCollatorForLanguageModeling(tokenizer=tokenizer.enc, mlm=False),
     )
-
+    
     print("\n🏋️ Starting training...")
     trainer.train()
     trainer.save_model()
