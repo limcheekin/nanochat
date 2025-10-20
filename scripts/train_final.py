@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Fully Customizable and Optimized Base Model Pre-training with Unsloth.
-This definitive version (v6) provides the full API compatibility for the Trainer.
+This definitive version (v7) patches the model config to be fully compatible.
 """
 
 import os
@@ -19,24 +19,18 @@ from transformers import DataCollatorForLanguageModeling
 from nanochat.gpt import GPT, GPTConfig
 from nanochat.tokenizer import get_tokenizer
 
-# ===================================================================
-# 1. DEFINE THE FULLY COMPATIBLE ADAPTER CLASS
-# ===================================================================
 class UnslothCompatibleGPT(GPT):
     """
     An extended version of nanochat's GPT class that includes all
     methods required by the Hugging Face/Unsloth Trainer.
     """
     def get_input_embeddings(self):
-        # Provides access to the word embedding layer
         module = self.transformer.wte
         module.dtype = module.weight.dtype
         return module
 
     def get_output_embeddings(self):
-        # Provides access to the final language model head
         return self.lm_head
-# ===================================================================
 
 class StreamDatasetWrapper:
     """
@@ -81,7 +75,7 @@ def main():
     tokenizer = get_tokenizer()
     vocab_size = tokenizer.get_vocab_size()
 
-    print(f"🚀 Fully Customizable NanoChat Pre-training with Unsloth (v6)")
+    print(f"🚀 Fully Customizable NanoChat Pre-training with Unsloth (v7)")
     print(f"   Model Depth: {config.depth}, Max Seq Len: {config.max_seq_len}, Batch Size: {config.device_batch_size}")
     
     model_config = GPTConfig(
@@ -89,6 +83,12 @@ def main():
         n_embd=config.depth * 64, n_head=max(1, ((config.depth * 64) + 127) // 128),
         n_kv_head=max(1, ((config.depth * 64) + 127) // 128)
     )
+    
+    # ========================== THE FINAL CHANGE IS HERE ==========================
+    # We patch the config object to include the attribute the trainer is looking for.
+    # We can set it to a dummy name; its value doesn't matter, it just needs to exist.
+    model_config._name_or_path = "Custom/nanochat-gpt"
+    # ============================================================================
     
     with torch.device("meta"):
         model = UnslothCompatibleGPT(model_config)
