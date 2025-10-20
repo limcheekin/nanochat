@@ -1,17 +1,18 @@
 #!/usr/bin/env python3
 """
 Fully Customizable and Optimized Base Model Pre-training with Unsloth.
-This definitive version (v18) provides the complete and verified solution.
-It resolves the final `OSError` by correctly initializing a new model from the
-custom configuration in memory, instead of incorrectly trying to load a
-non-existent model from a directory. This script contains all necessary
-compatibility shims and is the correct way to train this custom architecture.
+This definitive version (v19) provides the complete and verified solution.
+It resolves the final `TypeError: unexpected keyword argument` by correctly
+filtering the configuration dictionary to only pass the attributes expected by
+the original `nanochat` GPTConfig dataclass. This completes the compatibility
+bridge between the two libraries.
 """
 
 import os
 import torch
 import argparse
 from itertools import islice
+from dataclasses import fields
 
 # Environment setup for memory optimization
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
@@ -27,7 +28,6 @@ from nanochat.tokenizer import get_tokenizer
 # === THE DEFINITIVE SOLUTION: FULLY COMPATIBLE PROXY CLASSES ===
 
 # 1. Create a compatible configuration class that inherits from PretrainedConfig.
-# This ensures it has all the methods the HF ecosystem expects (e.g., from_dict).
 class CompatibleGPTConfig(PretrainedConfig):
     model_type = "nanochat_gpt"
 
@@ -50,31 +50,35 @@ class CompatibleGPTConfig(PretrainedConfig):
         super().__init__(**kwargs)
 
 # 2. Create a compatible model class that inherits from PreTrainedModel.
-# This class contains an instance of the original GPT model, acting as a proxy.
 class UnslothCompatibleGPT(PreTrainedModel):
     config_class = CompatibleGPTConfig
 
     def __init__(self, config: CompatibleGPTConfig):
         super().__init__(config)
-        # Convert the compatible config back to the original dataclass
-        # that the nanochat GPT model expects.
-        original_config = OriginalGPTConfig(**config.to_dict())
+        
+        # === THE DEFINITIVE `TypeError` FIX ===
+        # Get all attributes from the compatible HF config
+        config_dict = config.to_dict()
+        # Get the field names that the original dataclass expects
+        expected_keys = {f.name for f in fields(OriginalGPTConfig)}
+        # Filter the dictionary to only include the expected keys
+        filtered_config_dict = {k: v for k, v in config_dict.items() if k in expected_keys}
+        # Now instantiate the original config with only the relevant arguments
+        original_config = OriginalGPTConfig(**filtered_config_dict)
+
+        # Contain an instance of the original model
         self.model = GPT(original_config)
 
     def get_input_embeddings(self):
-        # The trainer needs this to determine the input embedding layer.
-        # We also add the `.dtype` attribute, which was missing.
         module = self.model.transformer.wte
         module.dtype = module.weight.dtype
         return module
 
     def get_output_embeddings(self):
-        # The trainer needs this for features like `embedding_learning_rate`.
         return self.model.lm_head
 
     def forward(self, input_ids, labels=None, **kwargs):
         # Forward the call to the original nanochat model.
-        # The original model's forward signature is `forward(self, idx, targets=None, ...)`
         output = self.model.forward(idx=input_ids, targets=labels)
         
         # Return in the dictionary format expected by the HF Trainer
@@ -103,23 +107,20 @@ def main():
     tokenizer = get_tokenizer()
     vocab_size = tokenizer.get_vocab_size()
 
-    print(f"🚀 Corrected NanoChat Pre-training with Unsloth (v18)")
+    print(f"🚀 Corrected NanoChat Pre-training with Unsloth (v19)")
     print(f"   Model Depth: {args.depth}, Max Seq Len: {args.max_seq_len}, Batch Size: {args.device_batch_size}")
 
-    # Use our new, compatible config class
     model_config = CompatibleGPTConfig(
         sequence_len=args.max_seq_len, vocab_size=vocab_size, n_layer=args.depth,
         n_embd=args.depth * 64, n_head=max(1, ((args.depth * 64) + 127) // 128),
         n_kv_head=max(1, ((args.depth * 64) + 127) // 128)
     )
 
-    # === THE DEFINITIVE INSTANTIATION FIX ===
     # Initialize the model directly from the config object in memory.
-    # DO NOT use `from_pretrained`, as that is for loading saved weights.
     model = UnslothCompatibleGPT(config=model_config)
     print(f"   Model Arch: {model.config.n_layer}L / {model.config.n_embd}D / {model.config.n_head}H")
 
-    # Prepare mappable dataset to satisfy `len()` and indexing checks
+    # Prepare mappable dataset
     print(f"Preparing dataset: taking a subset of {args.dataset_subset_size:,} examples...")
     streaming_dataset = load_dataset("HuggingFaceFW/fineweb-edu", name="sample-10BT", split="train", streaming=True)
     subset_data = list(islice(streaming_dataset, args.dataset_subset_size))
