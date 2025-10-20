@@ -1,12 +1,10 @@
 #!/usr/bin/env python3
 """
 Fully Customizable and Optimized Base Model Pre-training with Unsloth.
-This definitive version (v9) provides the correct solution by using the
-`FastLanguageModel` wrapper, which is the intended Unsloth API for preparing
-a custom `torch.nn.Module` for training. This resolves the `RepositoryNotFoundError`
-by correctly configuring the model so the trainer does not attempt to access the
-Hugging Face Hub. This version also retains the mappable dataset fix, which is
-necessary to satisfy the trainer's internal `len()` and indexing checks.
+This definitive version (v10) uses the correct `FastLanguageModel.from_model()`
+static method to wrap the custom nanochat GPT model, which is the official
+Unsloth API for this purpose. This resolves the `TypeError: FastLanguageModel()
+takes no arguments` and ensures full compatibility with the trainer.
 """
 
 import os
@@ -24,9 +22,6 @@ from transformers import DataCollatorForLanguageModeling
 
 from nanochat.gpt import GPT, GPTConfig
 from nanochat.tokenizer import get_tokenizer
-
-# NOTE: The custom UnslothCompatibleGPT wrapper is NO LONGER NEEDED.
-# The FastLanguageModel wrapper handles all necessary patching.
 
 @dataclass
 class TrainingConfig:
@@ -62,7 +57,7 @@ def main():
     tokenizer = get_tokenizer()
     vocab_size = tokenizer.get_vocab_size()
 
-    print(f"🚀 Corrected NanoChat Pre-training with Unsloth (v9)")
+    print(f"🚀 Corrected NanoChat Pre-training with Unsloth (v10)")
     print(f"   Model Depth: {config.depth}, Max Seq Len: {config.max_seq_len}, Batch Size: {config.device_batch_size}")
 
     model_config = GPTConfig(
@@ -79,9 +74,12 @@ def main():
     print(f"   Model Arch: {model_config.n_layer}L / {model_config.n_embd}D / {model_config.n_head}H")
 
     # === THE DEFINITIVE MODEL FIX ===
-    # Wrap the raw PyTorch model with FastLanguageModel. This is the correct
-    # Unsloth API for making a custom model compatible with the trainer.
-    model = FastLanguageModel(model)
+    # Use the correct `from_model` static method to wrap the raw PyTorch model.
+    # This is the official Unsloth API for custom architectures.
+    model, _ = FastLanguageModel.from_model(
+        model = model,
+        model_name = "nanochat", # Provide a name for the custom model
+    )
 
     # === THE DEFINITIVE DATASET FIX ===
     # Create a mappable dataset that supports len() and indexing.
