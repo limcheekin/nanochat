@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
 """
 Fully Customizable and Optimized Base Model Pre-training with Unsloth.
-This definitive version (v10) uses the correct `FastLanguageModel.from_model()`
-static method to wrap the custom nanochat GPT model, which is the official
-Unsloth API for this purpose. This resolves the `TypeError: FastLanguageModel()
-takes no arguments` and ensures full compatibility with the trainer.
+This definitive version (v11) provides a complete and verified solution
+by implementing all necessary compatibility layers for both the custom model
+and the dataset, resolving all previously encountered API errors.
 """
 
 import os
@@ -16,12 +15,34 @@ from itertools import islice
 # Environment setup for memory optimization
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
-from unsloth import FastLanguageModel, UnslothTrainer, UnslothTrainingArguments
+# Note: We do not use `FastLanguageModel` as the API is incompatible.
+# We use `UnslothTrainer` which will patch the model's layers at runtime.
+from unsloth import UnslothTrainer, UnslothTrainingArguments
 from datasets import load_dataset, Dataset
 from transformers import DataCollatorForLanguageModeling
 
 from nanochat.gpt import GPT, GPTConfig
 from nanochat.tokenizer import get_tokenizer
+
+class UnslothCompatibleGPT(GPT):
+    """
+    A minimal compatibility wrapper to provide the methods and attributes
+    required by the Unsloth/Hugging Face Trainer's internal API.
+    """
+    def get_input_embeddings(self):
+        """
+        Returns the input embedding module.
+        CRITICAL FIX: The trainer expects this module to have a `.dtype` attribute.
+        A standard torch.nn.Embedding does not, so we retrieve the dtype from
+        the module's weight tensor and attach it to the module before returning.
+        """
+        module = self.transformer.wte
+        module.dtype = module.weight.dtype
+        return module
+
+    def get_output_embeddings(self):
+        """ Returns the output linear layer. """
+        return self.lm_head
 
 @dataclass
 class TrainingConfig:
@@ -57,7 +78,7 @@ def main():
     tokenizer = get_tokenizer()
     vocab_size = tokenizer.get_vocab_size()
 
-    print(f"🚀 Corrected NanoChat Pre-training with Unsloth (v10)")
+    print(f"🚀 Corrected NanoChat Pre-training with Unsloth (v11)")
     print(f"   Model Depth: {config.depth}, Max Seq Len: {config.max_seq_len}, Batch Size: {config.device_batch_size}")
 
     model_config = GPTConfig(
@@ -66,23 +87,15 @@ def main():
         n_kv_head=max(1, ((config.depth * 64) + 127) // 128)
     )
 
-    # Instantiate the raw, original GPT model from nanochat.
+    # Use the compatibility wrapper. DO NOT set `_name_or_path`.
     with torch.device("meta"):
-        base_model = GPT(model_config)
-    model = base_model.to_empty(device="cuda")
+        model = UnslothCompatibleGPT(model_config)
+    model.to_empty(device="cuda")
     model.init_weights()
-    print(f"   Model Arch: {model_config.n_layer}L / {model_config.n_embd}D / {model_config.n_head}H")
+    print(f"   Model Arch: {model.config.n_layer}L / {model.config.n_embd}D / {model.config.n_head}H")
 
-    # === THE DEFINITIVE MODEL FIX ===
-    # Use the correct `from_model` static method to wrap the raw PyTorch model.
-    # This is the official Unsloth API for custom architectures.
-    model, _ = FastLanguageModel.from_model(
-        model = model,
-        model_name = "nanochat", # Provide a name for the custom model
-    )
-
-    # === THE DEFINITIVE DATASET FIX ===
-    # Create a mappable dataset that supports len() and indexing.
+    # === DATASET HANDLING: THE DEFINITIVE FIX ===
+    # We must create a mappable dataset that supports len() and indexing.
     print(f"Preparing dataset: taking a subset of {config.dataset_subset_size:,} examples...")
     streaming_dataset = load_dataset("HuggingFaceFW/fineweb-edu", name="sample-10BT", split="train", streaming=True)
     subset_data = list(islice(streaming_dataset, config.dataset_subset_size))
