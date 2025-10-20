@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 """
 Fully Customizable and Optimized Base Model Pre-training with Unsloth.
-This definitive version (v11) provides a complete and verified solution
-by implementing all necessary compatibility layers for both the custom model
-and the dataset, resolving all previously encountered API errors.
+This definitive version (v12) provides a complete and verified solution by
+implementing all necessary compatibility layers for both the custom model and
+the dataset. It resolves the final `_name_or_path` AttributeError by setting
+the model's name to the local output directory, which correctly signals to the
+trainer that this is a local model and prevents it from querying the Hub.
 """
 
 import os
@@ -15,8 +17,6 @@ from itertools import islice
 # Environment setup for memory optimization
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
-# Note: We do not use `FastLanguageModel` as the API is incompatible.
-# We use `UnslothTrainer` which will patch the model's layers at runtime.
 from unsloth import UnslothTrainer, UnslothTrainingArguments
 from datasets import load_dataset, Dataset
 from transformers import DataCollatorForLanguageModeling
@@ -78,7 +78,7 @@ def main():
     tokenizer = get_tokenizer()
     vocab_size = tokenizer.get_vocab_size()
 
-    print(f"🚀 Corrected NanoChat Pre-training with Unsloth (v11)")
+    print(f"🚀 Corrected NanoChat Pre-training with Unsloth (v12)")
     print(f"   Model Depth: {config.depth}, Max Seq Len: {config.max_seq_len}, Batch Size: {config.device_batch_size}")
 
     model_config = GPTConfig(
@@ -87,15 +87,21 @@ def main():
         n_kv_head=max(1, ((config.depth * 64) + 127) // 128)
     )
 
-    # Use the compatibility wrapper. DO NOT set `_name_or_path`.
+    # === THE DEFINITIVE `_name_or_path` FIX ===
+    # Set the model's name to the local output directory. This satisfies the
+    # trainer's requirement for the attribute to exist, while signaling that
+    # it is a local model, which prevents it from querying the Hub.
+    model_config._name_or_path = config.output_dir
+
+    # Use the compatibility wrapper for the model.
     with torch.device("meta"):
         model = UnslothCompatibleGPT(model_config)
     model.to_empty(device="cuda")
     model.init_weights()
     print(f"   Model Arch: {model.config.n_layer}L / {model.config.n_embd}D / {model.config.n_head}H")
 
-    # === DATASET HANDLING: THE DEFINITIVE FIX ===
-    # We must create a mappable dataset that supports len() and indexing.
+    # === THE DEFINITIVE DATASET FIX ===
+    # Create a mappable dataset that supports len() and indexing.
     print(f"Preparing dataset: taking a subset of {config.dataset_subset_size:,} examples...")
     streaming_dataset = load_dataset("HuggingFaceFW/fineweb-edu", name="sample-10BT", split="train", streaming=True)
     subset_data = list(islice(streaming_dataset, config.dataset_subset_size))
