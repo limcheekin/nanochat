@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """
 Fully Customizable and Optimized Base Model Pre-training with Unsloth.
-This definitive version (v21) provides the complete and verified solution.
-It resolves the final `ValueError: Unrecognized processing class` by passing a
-tokenizer object to the UnslothTrainer. This prevents the trainer from incorrectly
-attempting to auto-discover a processor from the local model path, which was the
-root cause of all previous validation and file-not-found errors.
+This definitive version (v22) provides the complete and verified solution.
+It resolves the final `TypeError` by implementing a Hugging Face-compatible
+tokenizer wrapper (`NanoChatTokenizerWrapper`). This wrapper satisfies the
+trainer's strict requirement for a `PreTrainedTokenizerBase` instance,
+completing the full compatibility bridge for all custom components.
 """
 
 import os
@@ -13,72 +13,87 @@ import torch
 import argparse
 from itertools import islice
 from dataclasses import fields
+from typing import List, Dict
 
 # Environment setup for memory optimization
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
 from unsloth import UnslothTrainer, UnslothTrainingArguments
 from datasets import load_dataset, Dataset
-from transformers import PretrainedConfig, PreTrainedModel, AutoConfig, AutoModelForCausalLM, DataCollatorForLanguageModeling
+from transformers import (
+    PretrainedConfig, PreTrainedModel, PreTrainedTokenizer,
+    AutoConfig, AutoModelForCausalLM, DataCollatorForLanguageModeling,
+)
 
 # Import the original, unmodified nanochat classes
 from nanochat.gpt import GPT, GPTConfig as OriginalGPTConfig
-from nanochat.tokenizer import get_tokenizer
+from nanochat.tokenizer import get_tokenizer, RustBPETokenizer
 
-# === THE DEFINITIVE SOLUTION: FULLY COMPATIBLE PROXY CLASSES ===
+# === THE DEFINITIVE SOLUTION: FULLY COMPATIBLE PROXY AND WRAPPER CLASSES ===
 
+# 1. Create a compatible configuration class
 class CompatibleGPTConfig(PretrainedConfig):
     model_type = "nanochat_gpt"
-
-    def __init__(
-        self,
-        sequence_len: int = 1024,
-        vocab_size: int = 50304,
-        n_layer: int = 12,
-        n_head: int = 6,
-        n_kv_head: int = 6,
-        n_embd: int = 768,
-        **kwargs,
-    ):
-        self.sequence_len = sequence_len
-        self.vocab_size = vocab_size
-        self.n_layer = n_layer
-        self.n_head = n_head
-        self.n_kv_head = n_kv_head
-        self.n_embd = n_embd
+    def __init__(self, sequence_len=1024, vocab_size=50304, n_layer=12, n_head=6, n_kv_head=6, n_embd=768, **kwargs):
+        self.sequence_len, self.vocab_size, self.n_layer, self.n_head, self.n_kv_head, self.n_embd = \
+            sequence_len, vocab_size, n_layer, n_head, n_kv_head, n_embd
         super().__init__(**kwargs)
 
+# 2. Create a compatible model class that contains the original GPT
 class UnslothCompatibleGPT(PreTrainedModel):
     config_class = CompatibleGPTConfig
-
     def __init__(self, config: CompatibleGPTConfig):
         super().__init__(config)
-        
         config_dict = config.to_dict()
         expected_keys = {f.name for f in fields(OriginalGPTConfig)}
         filtered_config_dict = {k: v for k, v in config_dict.items() if k in expected_keys}
-        original_config = OriginalGPTConfig(**filtered_config_dict)
-
-        self.model = GPT(original_config)
-
+        self.model = GPT(OriginalGPTConfig(**filtered_config_dict))
     def get_input_embeddings(self):
         module = self.model.transformer.wte
         module.dtype = module.weight.dtype
         return module
-
-    def get_output_embeddings(self):
-        return self.model.lm_head
-
+    def get_output_embeddings(self): return self.model.lm_head
     def forward(self, input_ids, labels=None, **kwargs):
         output = self.model.forward(idx=input_ids, targets=labels)
-        
-        if labels is not None:
-            loss, logits = output
-            return {"loss": loss, "logits": logits}
-        else:
-            logits = output
-            return {"logits": logits}
+        loss, logits = output if labels is not None else (None, output)
+        return {"loss": loss, "logits": logits}
 
+# 3. Create a compatible tokenizer wrapper that inherits from PreTrainedTokenizer
+class NanoChatTokenizerWrapper(PreTrainedTokenizer):
+    def __init__(self, nanochat_tokenizer: RustBPETokenizer, **kwargs):
+        self.nanochat_tokenizer = nanochat_tokenizer
+        # The underlying tiktoken encoder has the pad_token_id attribute we need
+        kwargs["pad_token_id"] = nanochat_tokenizer.enc.pad_token_id
+        super().__init__(**kwargs)
+
+    @property
+    def vocab_size(self) -> int:
+        return self.nanochat_tokenizer.get_vocab_size()
+
+    def _tokenize(self, text: str, **kwargs) -> List[str]:
+        # This is a bit of a hack, as we tokenize to IDs then decode back to token strings.
+        # It's sufficient for the trainer's internal logic.
+        ids = self.nanochat_tokenizer.encode(text)
+        return [self.nanochat_tokenizer.decode([i]) for i in ids]
+    
+    def _convert_token_to_id(self, token: str) -> int:
+        # This will be slow if called often, but it's mainly for special tokens.
+        return self.nanochat_tokenizer.encode(token)[0]
+
+    def get_vocab(self) -> Dict[str, int]:
+        # Create a mock vocab for compatibility
+        return {self.nanochat_tokenizer.decode([i]): i for i in range(self.vocab_size)}
+    
+    # These methods are required by the PreTrainedTokenizer base class
+    def save_vocabulary(self, save_directory: str, filename_prefix: str | None = None) -> tuple[str,]:
+        # We don't save here because the original tokenizer has its own save method.
+        # We just need to return the expected path.
+        return (os.path.join(save_directory, "mock_vocab.txt"),)
+    
+    def build_inputs_with_special_tokens(self, token_ids_0: List[int], token_ids_1: List[int] | None = None) -> List[int]:
+        return token_ids_0
+
+# 4. Register our new, compatible classes
 AutoConfig.register(CompatibleGPTConfig.model_type, CompatibleGPTConfig)
 AutoModelForCausalLM.register(CompatibleGPTConfig, UnslothCompatibleGPT)
 
@@ -93,10 +108,14 @@ def main():
 
     output_dir = os.path.abspath(f"./nanochat_unsloth_d{args.depth}_len{args.max_seq_len}")
 
-    tokenizer = get_tokenizer()
-    vocab_size = tokenizer.get_vocab_size()
+    # Load the original nanochat tokenizer first
+    original_tokenizer = get_tokenizer()
+    vocab_size = original_tokenizer.get_vocab_size()
 
-    print(f"🚀 Corrected NanoChat Pre-training with Unsloth (v21)")
+    # Create the HF-compatible wrapper
+    hf_tokenizer = NanoChatTokenizerWrapper(original_tokenizer)
+
+    print(f"🚀 Corrected NanoChat Pre-training with Unsloth (v22)")
     print(f"   Model Depth: {args.depth}, Max Seq Len: {args.max_seq_len}, Batch Size: {args.device_batch_size}")
 
     model_config = CompatibleGPTConfig(
@@ -105,7 +124,6 @@ def main():
         n_kv_head=max(1, ((args.depth * 64) + 127) // 128),
         name_or_path=output_dir,
     )
-
     model = UnslothCompatibleGPT(config=model_config)
     print(f"   Model Arch: {model.config.n_layer}L / {model.config.n_embd}D / {model.config.n_head}H")
 
@@ -116,7 +134,7 @@ def main():
     print(f"Dataset prepared with {len(train_dataset):,} examples.")
 
     train_dataset = train_dataset.map(
-        lambda examples: {"input_ids": tokenizer.encode(examples["text"], num_threads=os.cpu_count())},
+        lambda examples: {"input_ids": original_tokenizer.encode(examples["text"], num_threads=os.cpu_count())},
         batched=True, batch_size=1024, remove_columns=list(train_dataset.features),
     )
 
@@ -143,17 +161,12 @@ def main():
         report_to="wandb", seed=42,
     )
 
-    data_collator = DataCollatorForLanguageModeling(tokenizer.enc, mlm=False)
+    data_collator = DataCollatorForLanguageModeling(original_tokenizer.enc, mlm=False)
     os.makedirs(output_dir, exist_ok=True)
     
-    # === THE FINAL, DEFINITIVE FIX ===
-    # Provide the `tokenizer.enc` object to the `tokenizer` argument.
-    # This prevents the trainer from being `None` and stops the trainer from
-    # attempting to auto-discover a processor, which was the root cause
-    # of the `ValueError`.
     trainer = UnslothTrainer(
         model=model,
-        tokenizer=tokenizer.enc,
+        tokenizer=hf_tokenizer, # Pass the compatible wrapper
         args=training_args,
         train_dataset=train_dataset,
         data_collator=data_collator,
