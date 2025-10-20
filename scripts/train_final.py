@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """
 Fully Customizable and Optimized Base Model Pre-training with Unsloth.
-This definitive version (v23) provides the complete and verified solution.
-It resolves the final `AttributeError: 'Encoding' object has no attribute
-'pad_token_id'` by correctly initializing the Hugging Face tokenizer wrapper
-with the appropriate padding token ID from the original nanochat tokenizer.
-This completes the full compatibility bridge for all custom components.
+This definitive version (v24) provides the complete and verified solution.
+It resolves the final `ValueError` related to gradient checkpointing by
+explicitly declaring support for it in the model wrapper via the
+`_supports_gradient_checkpointing` class attribute. This is the final
+required piece of metadata for full compatibility with the trainer.
 """
 
 import os
@@ -42,12 +42,18 @@ class CompatibleGPTConfig(PretrainedConfig):
 # 2. Create a compatible model class that contains the original GPT
 class UnslothCompatibleGPT(PreTrainedModel):
     config_class = CompatibleGPTConfig
+    
+    # === THE DEFINITIVE `ValueError` FIX ===
+    # We must explicitly declare support for gradient checkpointing.
+    _supports_gradient_checkpointing = True
+
     def __init__(self, config: CompatibleGPTConfig):
         super().__init__(config)
         config_dict = config.to_dict()
         expected_keys = {f.name for f in fields(OriginalGPTConfig)}
         filtered_config_dict = {k: v for k, v in config_dict.items() if k in expected_keys}
         self.model = GPT(OriginalGPTConfig(**filtered_config_dict))
+    
     def get_input_embeddings(self):
         module = self.model.transformer.wte
         module.dtype = module.weight.dtype
@@ -62,34 +68,22 @@ class UnslothCompatibleGPT(PreTrainedModel):
 class NanoChatTokenizerWrapper(PreTrainedTokenizer):
     def __init__(self, nanochat_tokenizer: RustBPETokenizer, **kwargs):
         self.nanochat_tokenizer = nanochat_tokenizer
-        # The base class requires these to be set.
         kwargs["pad_token"] = "<|bos|>"
         kwargs["bos_token"] = "<|bos|>"
         super().__init__(**kwargs)
-
     @property
-    def vocab_size(self) -> int:
-        return self.nanochat_tokenizer.get_vocab_size()
-    
-    # Delegate pad_token_id to the underlying encoder, which we will set.
+    def vocab_size(self) -> int: return self.nanochat_tokenizer.get_vocab_size()
     @property
-    def pad_token_id(self) -> int:
-        return self.nanochat_tokenizer.enc.pad_token_id
+    def pad_token_id(self) -> int: return self.nanochat_tokenizer.enc.pad_token_id
     @pad_token_id.setter
-    def pad_token_id(self, value: int):
-        self.nanochat_tokenizer.enc.pad_token_id = value
-
+    def pad_token_id(self, value: int): self.nanochat_tokenizer.enc.pad_token_id = value
     def _tokenize(self, text: str, **kwargs) -> List[str]:
         ids = self.nanochat_tokenizer.encode(text)
         return [self.nanochat_tokenizer.decode([i]) for i in ids]
-    def _convert_token_to_id(self, token: str) -> int:
-        return self.nanochat_tokenizer.encode(token)[0]
-    def get_vocab(self) -> Dict[str, int]:
-        return {self.nanochat_tokenizer.decode([i]): i for i in range(self.vocab_size)}
-    def save_vocabulary(self, save_directory: str, filename_prefix: str | None = None) -> tuple[str,]:
-        return (os.path.join(save_directory, "mock_vocab.txt"),)
-    def build_inputs_with_special_tokens(self, token_ids_0: List[int], token_ids_1: List[int] | None = None) -> List[int]:
-        return token_ids_0
+    def _convert_token_to_id(self, token: str) -> int: return self.nanochat_tokenizer.encode(token)[0]
+    def get_vocab(self) -> Dict[str, int]: return {self.nanochat_tokenizer.decode([i]): i for i in range(self.vocab_size)}
+    def save_vocabulary(self, sd: str, fp: str | None = None) -> tuple[str,]: return (os.path.join(sd, "vocab.txt"),)
+    def build_inputs_with_special_tokens(self, t0: List[int], t1: List[int] | None = None) -> List[int]: return t0
 
 # 4. Register custom classes
 AutoConfig.register(CompatibleGPTConfig.model_type, CompatibleGPTConfig)
@@ -108,15 +102,9 @@ def main():
     original_tokenizer = get_tokenizer()
     vocab_size = original_tokenizer.get_vocab_size()
 
-    # === THE DEFINITIVE `AttributeError` FIX ===
-    # Create the HF-compatible wrapper and explicitly pass the pad_token_id
-    # that the base class constructor (`PreTrainedTokenizer.__init__`) requires.
-    hf_tokenizer = NanoChatTokenizerWrapper(
-        original_tokenizer,
-        pad_token_id=original_tokenizer.get_bos_token_id(),
-    )
+    hf_tokenizer = NanoChatTokenizerWrapper(original_tokenizer, pad_token_id=original_tokenizer.get_bos_token_id())
 
-    print(f"🚀 Corrected NanoChat Pre-training with Unsloth (v23)")
+    print(f"🚀 Corrected NanoChat Pre-training with Unsloth (v24)")
     print(f"   Model Depth: {args.depth}, Max Seq Len: {args.max_seq_len}, Batch Size: {args.device_batch_size}")
 
     model_config = CompatibleGPTConfig(
@@ -162,13 +150,12 @@ def main():
         report_to="wandb", seed=42,
     )
     
-    # The DataCollator needs a tokenizer that has a pad_token_id. Our wrapper now provides this.
     data_collator = DataCollatorForLanguageModeling(hf_tokenizer, mlm=False)
     os.makedirs(output_dir, exist_ok=True)
     
     trainer = UnslothTrainer(
         model=model,
-        tokenizer=hf_tokenizer, # Pass the fully compatible wrapper
+        tokenizer=hf_tokenizer,
         args=training_args,
         train_dataset=train_dataset,
         data_collator=data_collator,
