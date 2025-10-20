@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
 Fully Customizable and Optimized Base Model Pre-training with Unsloth.
-This definitive version (v4) correctly handles streaming datasets by removing
-unnecessary wrappers and relying on the Unsloth Trainer's native support,
-while providing the minimal necessary compatibility layers for the custom model.
+This definitive version (v5) uses a corrected, minimal compatibility layer
+for both the custom model and the streaming dataset, resolving all previously
+encountered API incompatibilities with the Unsloth Trainer.
 """
 
 import os
@@ -11,7 +11,7 @@ import torch
 import argparse
 from dataclasses import dataclass
 
-# Environment setup
+# Environment setup for memory optimization
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
 from unsloth import UnslothTrainer, UnslothTrainingArguments
@@ -27,20 +27,32 @@ class UnslothCompatibleGPT(GPT):
     methods and attributes required by the Unsloth/Hugging Face Trainer API.
     """
     def get_input_embeddings(self):
-        """ 
+        """
         Returns the input embedding module.
         CRITICAL FIX: The trainer expects this module to have a `.dtype` attribute.
         A standard torch.nn.Embedding does not, so we retrieve the dtype from
         the module's weight tensor and attach it to the module before returning.
         """
         module = self.transformer.wte
-        # Attach the dtype from the weight parameter to the module itself
         module.dtype = module.weight.dtype
         return module
 
     def get_output_embeddings(self):
-        """ Returns the output linear layer (for tying weights or applying embedding LR). """
+        """ Returns the output linear layer. """
         return self.lm_head
+
+class StreamDatasetWrapper:
+    """
+    A corrected wrapper for Hugging Face IterableDataset.
+    It provides the essential `column_names` attribute required by the trainer's
+    internal logic, which is the fix for the `TypeError: argument of type 'NoneType' is not iterable`.
+    """
+    def __init__(self, dataset, columns):
+        self.dataset = dataset
+        self.column_names = columns
+
+    def __iter__(self):
+        return iter(self.dataset)
 
 @dataclass
 class TrainingConfig:
@@ -73,47 +85,49 @@ def main():
     tokenizer = get_tokenizer()
     vocab_size = tokenizer.get_vocab_size()
 
-    print(f"🚀 Corrected NanoChat Pre-training with Unsloth (v4)")
+    print(f"🚀 Corrected NanoChat Pre-training with Unsloth (v5)")
     print(f"   Model Depth: {config.depth}, Max Seq Len: {config.max_seq_len}, Batch Size: {config.device_batch_size}")
-    
+
     model_config = GPTConfig(
         sequence_len=config.max_seq_len, vocab_size=vocab_size, n_layer=config.depth,
         n_embd=config.depth * 64, n_head=max(1, ((config.depth * 64) + 127) // 128),
         n_kv_head=max(1, ((config.depth * 64) + 127) // 128)
     )
-    
-    # This attribute is still required by the trainer's internal logic.
+
     model_config._name_or_path = "Custom/nanochat-gpt"
-    
+
     with torch.device("meta"):
         model = UnslothCompatibleGPT(model_config)
     model.to_empty(device="cuda")
     model.init_weights()
-    
+
     print(f"   Model Arch: {model.config.n_layer}L / {model.config.n_embd}D / {model.config.n_head}H")
-    
+
     dataset = load_dataset("HuggingFaceFW/fineweb-edu", name="sample-10BT", split="train", streaming=True)
-    
+
     def tokenize(examples):
         return {"input_ids": tokenizer.encode(examples["text"], num_threads=8)}
 
-    # Tokenize the dataset and remove all original columns. The trainer only needs `input_ids`.
-    train_dataset = dataset.map(
+    # Tokenize and remove original columns. The trainer only needs `input_ids`.
+    tokenized_dataset = dataset.map(
         tokenize, batched=True, remove_columns=list(dataset.features)
     )
-    
+
+    # Use the corrected dataset wrapper to provide the `column_names` attribute.
+    train_dataset = StreamDatasetWrapper(tokenized_dataset, columns=["input_ids"])
+
     num_params = sum(p.numel() for p in model.parameters())
     num_steps = (config.target_param_data_ratio * num_params) // config.total_batch_size
     tokens_per_device_step = config.device_batch_size * config.max_seq_len
     world_size = int(os.environ.get("WORLD_SIZE", 1))
     grad_accum = config.total_batch_size // (tokens_per_device_step * world_size)
-    
+
     print(f"📊 Training: {num_params:,} params, {num_steps:,} steps, {grad_accum}x accumulation")
-    
+
     dmodel_scale = (model_config.n_embd / 768) ** -0.5
     base_lr = config.base_lr * dmodel_scale
     emb_lr = base_lr * config.embedding_lr_scale
-    
+
     training_args = UnslothTrainingArguments(
         output_dir=config.output_dir, max_steps=num_steps,
         per_device_train_batch_size=config.device_batch_size, gradient_accumulation_steps=grad_accum,
@@ -123,12 +137,9 @@ def main():
         save_steps=config.save_every, save_total_limit=3, dataloader_num_workers=4,
         report_to="wandb", seed=42,
     )
-    
+
     tokenizer.enc.pad_token_id = tokenizer.get_bos_token_id()
-    
-    # === CORRECTED TRAINER INITIALIZATION ===
-    # Pass the raw, tokenized IterableDataset directly. The trainer will
-    # handle it correctly and will not call `len()` on it.
+
     trainer = UnslothTrainer(
         model=model,
         tokenizer=None,
@@ -136,7 +147,7 @@ def main():
         train_dataset=train_dataset,
         data_collator=DataCollatorForLanguageModeling(tokenizer=tokenizer.enc, mlm=False),
     )
-    
+
     print("\n🏋️ Starting training...")
     trainer.train()
     trainer.save_model()
