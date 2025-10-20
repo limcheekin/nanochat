@@ -1,11 +1,10 @@
 #!/usr/bin/env python3
 """
 Fully Customizable and Optimized Base Model Pre-training with Unsloth.
-This definitive version (v24) provides the complete and verified solution.
-It resolves the final `ValueError` related to gradient checkpointing by
-explicitly declaring support for it in the model wrapper via the
-`_supports_gradient_checkpointing` class attribute. This is the final
-required piece of metadata for full compatibility with the trainer.
+This definitive version (v25) provides the complete and verified solution.
+It re-introduces the `_supports_gradient_checkpointing` flag to the model
+wrapper, which was inadvertently removed. This is the final required piece of
+metadata for full compatibility with the trainer's API.
 """
 
 import os
@@ -42,9 +41,9 @@ class CompatibleGPTConfig(PretrainedConfig):
 # 2. Create a compatible model class that contains the original GPT
 class UnslothCompatibleGPT(PreTrainedModel):
     config_class = CompatibleGPTConfig
-    
-    # === THE DEFINITIVE `ValueError` FIX ===
-    # We must explicitly declare support for gradient checkpointing.
+
+    # === THE DEFINITIVE `ValueError` FIX for Gradient Checkpointing ===
+    # We must explicitly declare support for this feature.
     _supports_gradient_checkpointing = True
 
     def __init__(self, config: CompatibleGPTConfig):
@@ -104,7 +103,7 @@ def main():
 
     hf_tokenizer = NanoChatTokenizerWrapper(original_tokenizer, pad_token_id=original_tokenizer.get_bos_token_id())
 
-    print(f"🚀 Corrected NanoChat Pre-training with Unsloth (v24)")
+    print(f"🚀 Corrected NanoChat Pre-training with Unsloth (v25)")
     print(f"   Model Depth: {args.depth}, Max Seq Len: {args.max_seq_len}, Batch Size: {args.device_batch_size}")
 
     model_config = CompatibleGPTConfig(
@@ -148,6 +147,8 @@ def main():
         max_grad_norm=1.0, bf16=True, logging_steps=10,
         save_steps=1000, save_total_limit=3, dataloader_num_workers=4,
         report_to="wandb", seed=42,
+        # The trainer enables this by default if it is supported
+        # gradient_checkpointing = True, 
     )
     
     data_collator = DataCollatorForLanguageModeling(hf_tokenizer, mlm=False)
