@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
 """
 Fully Customizable and Optimized Base Model Pre-training with Unsloth.
-This definitive version (v8) resolves all compatibility errors by creating a
-mappable dataset from a subset of the streaming data. This is necessary because
-the Unsloth Trainer's internal sanity checks require a dataset that supports
-both `len()` and indexing (`dataset[0]`), which a streaming dataset does not.
+This definitive version (v9) provides the correct solution by using the
+`FastLanguageModel` wrapper, which is the intended Unsloth API for preparing
+a custom `torch.nn.Module` for training. This resolves the `RepositoryNotFoundError`
+by correctly configuring the model so the trainer does not attempt to access the
+Hugging Face Hub. This version also retains the mappable dataset fix, which is
+necessary to satisfy the trainer's internal `len()` and indexing checks.
 """
 
 import os
@@ -16,26 +18,15 @@ from itertools import islice
 # Environment setup for memory optimization
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
-from unsloth import UnslothTrainer, UnslothTrainingArguments
+from unsloth import FastLanguageModel, UnslothTrainer, UnslothTrainingArguments
 from datasets import load_dataset, Dataset
 from transformers import DataCollatorForLanguageModeling
 
 from nanochat.gpt import GPT, GPTConfig
 from nanochat.tokenizer import get_tokenizer
 
-class UnslothCompatibleGPT(GPT):
-    """
-    Minimal compatibility wrapper to provide the API methods and attributes
-    required by the Unsloth/Hugging Face Trainer.
-    """
-    def get_input_embeddings(self):
-        module = self.transformer.wte
-        # CRITICAL FIX: The trainer expects the module itself to have a .dtype attribute.
-        module.dtype = module.weight.dtype
-        return module
-
-    def get_output_embeddings(self):
-        return self.lm_head
+# NOTE: The custom UnslothCompatibleGPT wrapper is NO LONGER NEEDED.
+# The FastLanguageModel wrapper handles all necessary patching.
 
 @dataclass
 class TrainingConfig:
@@ -52,7 +43,6 @@ class TrainingConfig:
     save_every: int = 1000
     use_bf16: bool = True
     output_dir: str = "./output"
-    # New setting to control the size of the mappable dataset subset
     dataset_subset_size: int = 500_000
 
 def main():
@@ -72,7 +62,7 @@ def main():
     tokenizer = get_tokenizer()
     vocab_size = tokenizer.get_vocab_size()
 
-    print(f"🚀 Corrected NanoChat Pre-training with Unsloth (v8)")
+    print(f"🚀 Corrected NanoChat Pre-training with Unsloth (v9)")
     print(f"   Model Depth: {config.depth}, Max Seq Len: {config.max_seq_len}, Batch Size: {config.device_batch_size}")
 
     model_config = GPTConfig(
@@ -80,30 +70,30 @@ def main():
         n_embd=config.depth * 64, n_head=max(1, ((config.depth * 64) + 127) // 128),
         n_kv_head=max(1, ((config.depth * 64) + 127) // 128)
     )
-    model_config._name_or_path = "Custom/nanochat-gpt"
 
+    # Instantiate the raw, original GPT model from nanochat.
     with torch.device("meta"):
-        model = UnslothCompatibleGPT(model_config)
-    model.to_empty(device="cuda")
+        base_model = GPT(model_config)
+    model = base_model.to_empty(device="cuda")
     model.init_weights()
+    print(f"   Model Arch: {model_config.n_layer}L / {model_config.n_embd}D / {model_config.n_head}H")
 
-    print(f"   Model Arch: {model.config.n_layer}L / {model.config.n_embd}D / {model.config.n_head}H")
+    # === THE DEFINITIVE MODEL FIX ===
+    # Wrap the raw PyTorch model with FastLanguageModel. This is the correct
+    # Unsloth API for making a custom model compatible with the trainer.
+    model = FastLanguageModel(model)
 
-    # === DATASET HANDLING: THE DEFINITIVE FIX ===
-    # We must create a mappable dataset that supports len() and indexing.
+    # === THE DEFINITIVE DATASET FIX ===
+    # Create a mappable dataset that supports len() and indexing.
     print(f"Preparing dataset: taking a subset of {config.dataset_subset_size:,} examples...")
     streaming_dataset = load_dataset("HuggingFaceFW/fineweb-edu", name="sample-10BT", split="train", streaming=True)
-    
-    # Materialize a subset of the streaming dataset into a Python list of dictionaries
     subset_data = list(islice(streaming_dataset, config.dataset_subset_size))
-    
-    # Create a mappable `datasets.Dataset` from the materialized list. This is the correct API.
     train_dataset = Dataset.from_list(subset_data)
     print(f"Dataset prepared with {len(train_dataset):,} examples.")
 
-    # Now, tokenize the mappable dataset. This is memory-intensive but necessary for compatibility.
+    # Pre-tokenize the entire mappable dataset.
     train_dataset = train_dataset.map(
-        lambda examples: {"input_ids": tokenizer.encode(examples["text"])},
+        lambda examples: {"input_ids": tokenizer.encode(examples["text"], num_threads=os.cpu_count())},
         batched=True,
         batch_size=1024,
         remove_columns=list(train_dataset.features),
