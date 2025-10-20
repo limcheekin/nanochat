@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
 Fully Customizable and Optimized Base Model Pre-training with Unsloth.
-This definitive version (v3) provides the correct, minimal compatibility
-layers to interface nanochat's custom GPT model with the Unsloth Trainer,
-resolving all API incompatibilities.
+This definitive version (v4) correctly handles streaming datasets by removing
+unnecessary wrappers and relying on the Unsloth Trainer's native support,
+while providing the minimal necessary compatibility layers for the custom model.
 """
 
 import os
@@ -23,11 +23,11 @@ from nanochat.tokenizer import get_tokenizer
 
 class UnslothCompatibleGPT(GPT):
     """
-    An extended version of nanochat's GPT class that includes all methods
-    and attributes required by the Hugging Face/Unsloth Trainer.
+    An extended version of nanochat's GPT class that includes the minimal
+    methods and attributes required by the Unsloth/Hugging Face Trainer API.
     """
     def get_input_embeddings(self):
-        """
+        """ 
         Returns the input embedding module.
         CRITICAL FIX: The trainer expects this module to have a `.dtype` attribute.
         A standard torch.nn.Embedding does not, so we retrieve the dtype from
@@ -39,23 +39,8 @@ class UnslothCompatibleGPT(GPT):
         return module
 
     def get_output_embeddings(self):
-        """
-        Returns the output linear layer. This is required for features
-        like `embedding_learning_rate` to apply to the LM head.
-        """
+        """ Returns the output linear layer (for tying weights or applying embedding LR). """
         return self.lm_head
-
-class StreamDatasetWrapper:
-    """
-    A wrapper to make a Hugging Face IterableDataset compatible with
-    the SFT Trainer by explicitly providing a `column_names` attribute.
-    """
-    def __init__(self, dataset, columns):
-        self.dataset = dataset
-        self.column_names = columns
-
-    def __iter__(self):
-        return iter(self.dataset)
 
 @dataclass
 class TrainingConfig:
@@ -88,7 +73,7 @@ def main():
     tokenizer = get_tokenizer()
     vocab_size = tokenizer.get_vocab_size()
 
-    print(f"🚀 Corrected NanoChat Pre-training with Unsloth (v3)")
+    print(f"🚀 Corrected NanoChat Pre-training with Unsloth (v4)")
     print(f"   Model Depth: {config.depth}, Max Seq Len: {config.max_seq_len}, Batch Size: {config.device_batch_size}")
     
     model_config = GPTConfig(
@@ -97,10 +82,9 @@ def main():
         n_kv_head=max(1, ((config.depth * 64) + 127) // 128)
     )
     
-    # The trainer requires this attribute to identify the model.
+    # This attribute is still required by the trainer's internal logic.
     model_config._name_or_path = "Custom/nanochat-gpt"
     
-    # Use the compatible wrapper with the dtype fix
     with torch.device("meta"):
         model = UnslothCompatibleGPT(model_config)
     model.to_empty(device="cuda")
@@ -113,13 +97,10 @@ def main():
     def tokenize(examples):
         return {"input_ids": tokenizer.encode(examples["text"], num_threads=8)}
 
-    # Remove original columns to prevent conflicts. The trainer only needs `input_ids`.
-    tokenized_dataset = dataset.map(
+    # Tokenize the dataset and remove all original columns. The trainer only needs `input_ids`.
+    train_dataset = dataset.map(
         tokenize, batched=True, remove_columns=list(dataset.features)
     )
-    
-    # Use the dataset wrapper to provide the required `column_names` attribute
-    train_dataset = StreamDatasetWrapper(tokenized_dataset, columns=["input_ids"])
     
     num_params = sum(p.numel() for p in model.parameters())
     num_steps = (config.target_param_data_ratio * num_params) // config.total_batch_size
@@ -145,6 +126,9 @@ def main():
     
     tokenizer.enc.pad_token_id = tokenizer.get_bos_token_id()
     
+    # === CORRECTED TRAINER INITIALIZATION ===
+    # Pass the raw, tokenized IterableDataset directly. The trainer will
+    # handle it correctly and will not call `len()` on it.
     trainer = UnslothTrainer(
         model=model,
         tokenizer=None,
