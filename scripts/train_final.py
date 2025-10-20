@@ -17,8 +17,8 @@ from typing import List, Dict
 # Environment setup for memory optimization
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
-# <<< FIX: Import FastLanguageModel >>>
-from unsloth import FastLanguageModel, UnslothTrainer, UnslothTrainingArguments
+# No need to import FastLanguageModel for this approach
+from unsloth import UnslothTrainer, UnslothTrainingArguments
 from datasets import load_dataset, Dataset
 from transformers import (
     PretrainedConfig, PreTrainedModel, PreTrainedTokenizer,
@@ -30,6 +30,7 @@ from nanochat.gpt import GPT, GPTConfig as OriginalGPTConfig
 from nanochat.tokenizer import get_tokenizer, RustBPETokenizer
 
 # === THE DEFINITIVE SOLUTION: FULLY COMPATIBLE PROXY AND WRAPPER CLASSES ===
+# Your custom wrapper classes are PRESERVED
 
 # 1. Create a compatible configuration class
 class CompatibleGPTConfig(PretrainedConfig):
@@ -43,7 +44,6 @@ class CompatibleGPTConfig(PretrainedConfig):
 class UnslothCompatibleGPT(PreTrainedModel):
     config_class = CompatibleGPTConfig
 
-    # We must explicitly declare support for this feature.
     _supports_gradient_checkpointing = True
 
     def __init__(self, config: CompatibleGPTConfig):
@@ -115,14 +115,9 @@ def main():
     model = UnslothCompatibleGPT(config=model_config)
     print(f"   Model Arch: {model.config.n_layer}L / {model.config.n_embd}D / {model.config.n_head}H")
 
-    # <<< FIX: WRAP THE MODEL WITH FastLanguageModel >>>
-    # This is the crucial step to apply Unsloth's patches.
-    # We explicitly tell it to prepare the model for gradient checkpointing.
-    model = FastLanguageModel(
-        model,
-        use_gradient_checkpointing = True,
-    )
-    
+    # <<< FIX: REMOVED THE INCORRECT FastLanguageModel CALL >>>
+    # The UnslothTrainer will handle all model patching automatically.
+
     print(f"Preparing dataset: taking a subset of {args.dataset_subset_size:,} examples...")
     streaming_dataset = load_dataset("HuggingFaceFW/fineweb-edu", name="sample-10BT", split="train", streaming=True)
     subset_data = list(islice(streaming_dataset, args.dataset_subset_size))
@@ -155,15 +150,13 @@ def main():
         max_grad_norm=1.0, bf16=True, logging_steps=10,
         save_steps=1000, save_total_limit=3, dataloader_num_workers=4,
         report_to="wandb", seed=42,
-        # <<< FIX: EXPLICITLY ENABLE GRADIENT CHECKPOINTING IN TRAINER ARGS >>>
-        # This argument tells the Trainer to *try* to enable checkpointing.
-        # The FastLanguageModel wrapping above is what makes this succeed.
         gradient_checkpointing = True,
     )
     
     data_collator = DataCollatorForLanguageModeling(hf_tokenizer, mlm=False)
     os.makedirs(output_dir, exist_ok=True)
     
+    # Pass the UnslothCompatibleGPT instance directly to the trainer
     trainer = UnslothTrainer(
         model=model,
         tokenizer=hf_tokenizer,
