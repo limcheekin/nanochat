@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Fully Customizable and Optimized Base Model Pre-training with Unsloth.
-This definitive version (v4) fixes the streaming dataset incompatibility.
+This definitive version (v5) fixes the streaming dataset incompatibility with the Trainer.
 """
 
 import os
@@ -28,6 +28,22 @@ class UnslothCompatibleGPT(GPT):
         module = self.transformer.wte
         module.dtype = module.weight.dtype
         return module
+
+# ===================================================================
+# 1. DEFINE THE DATASET WRAPPER TO FIX THE 'NoneType' ERROR
+# ===================================================================
+class StreamDatasetWrapper:
+    """
+    A wrapper to make a Hugging Face IterableDataset compatible with
+    the Unsloth/SFT Trainer by explicitly providing a `column_names` attribute.
+    """
+    def __init__(self, dataset, columns):
+        self.dataset = dataset
+        self.column_names = columns
+
+    def __iter__(self):
+        return iter(self.dataset)
+# ===================================================================
 
 @dataclass
 class TrainingConfig:
@@ -60,7 +76,7 @@ def main():
     tokenizer = get_tokenizer()
     vocab_size = tokenizer.get_vocab_size()
 
-    print(f"🚀 Fully Customizable NanoChat Pre-training with Unsloth (v4)")
+    print(f"🚀 Fully Customizable NanoChat Pre-training with Unsloth (v5)")
     print(f"   Model Depth: {config.depth}, Max Seq Len: {config.max_seq_len}, Batch Size: {config.device_batch_size}")
     
     model_config = GPTConfig(
@@ -81,16 +97,19 @@ def main():
     def tokenize(examples):
         return {"input_ids": tokenizer.encode(examples["text"], num_threads=8)}
 
-    # ========================== THE FINAL CHANGE IS HERE ==========================
-    # We explicitly remove the original "text" column after tokenization.
-    # This creates a clean, iterable dataset containing only `input_ids`,
-    # which satisfies the Unsloth Trainer's internal checks.
-    train_dataset = dataset.map(
+    tokenized_dataset = dataset.map(
         tokenize,
         batched=True,
-        remove_columns=["text"] # This is the critical fix
+        remove_columns=["text"]
     )
-    # ============================================================================
+    
+    # ===================================================================
+    # 2. APPLY THE WRAPPER TO THE STREAMING DATASET
+    # ===================================================================
+    # After tokenization, our dataset only has the 'input_ids' column.
+    # We provide this list to the wrapper.
+    train_dataset = StreamDatasetWrapper(tokenized_dataset, columns=["input_ids"])
+    # ===================================================================
     
     num_params = sum(p.numel() for p in model.parameters())
     num_steps = (config.target_param_data_ratio * num_params) // config.total_batch_size
