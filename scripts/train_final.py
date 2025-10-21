@@ -44,6 +44,7 @@ class CompatibleGPTConfig(PretrainedConfig):
 class UnslothCompatibleGPT(PreTrainedModel):
     config_class = CompatibleGPTConfig
 
+    # Enable gradient checkpointing support
     _supports_gradient_checkpointing = True
 
     def __init__(self, config: CompatibleGPTConfig):
@@ -52,16 +53,77 @@ class UnslothCompatibleGPT(PreTrainedModel):
         expected_keys = {f.name for f in fields(OriginalGPTConfig)}
         filtered_config_dict = {k: v for k, v in config_dict.items() if k in expected_keys}
         self.model = GPT(OriginalGPTConfig(**filtered_config_dict))
-    
+        self.gradient_checkpointing = False
+
+    def _set_gradient_checkpointing(self, enable: bool = True):
+        """Enable or disable gradient checkpointing for this model."""
+        self.gradient_checkpointing = enable
+
     def get_input_embeddings(self):
         module = self.model.transformer.wte
         module.dtype = module.weight.dtype
         return module
-    def get_output_embeddings(self): return self.model.lm_head
+
+    def get_output_embeddings(self):
+        return self.model.lm_head
+
     def forward(self, input_ids, labels=None, **kwargs):
-        output = self.model.forward(idx=input_ids, targets=labels)
-        loss, logits = output if labels is not None else (None, output)
-        return {"loss": loss, "logits": logits}
+        # Always use our custom forward that returns both loss and logits
+        # This is necessary because the HF Trainer expects this format
+        from nanochat.gpt import norm
+
+        # If gradient checkpointing is enabled, wrap the forward pass
+        if self.gradient_checkpointing and self.training:
+            # Use torch.utils.checkpoint for gradient checkpointing
+            def create_custom_forward(module):
+                def custom_forward(*inputs):
+                    return module(*inputs)
+                return custom_forward
+
+            # We need to checkpoint each transformer block
+            x = self.model.transformer.wte(input_ids)
+            x = norm(x)
+
+            # Get rotary embeddings
+            B, T = input_ids.size()
+            cos_sin = self.model.cos[:, :T], self.model.sin[:, :T]
+
+            # Apply gradient checkpointing to each block
+            for block in self.model.transformer.h:
+                x = torch.utils.checkpoint.checkpoint(
+                    create_custom_forward(block),
+                    x, cos_sin, None,  # None for kv_cache during training
+                    use_reentrant=False
+                )
+
+            x = norm(x)
+        else:
+            # Normal forward pass without gradient checkpointing
+            B, T = input_ids.size()
+            cos_sin = self.model.cos[:, :T], self.model.sin[:, :T]
+            x = self.model.transformer.wte(input_ids)
+            x = norm(x)
+            for block in self.model.transformer.h:
+                x = block(x, cos_sin, None)  # None for kv_cache during training
+            x = norm(x)
+
+        # Compute logits (always needed for HF Trainer)
+        logits = self.model.lm_head(x)
+        softcap = 15
+        logits = softcap * torch.tanh(logits / softcap)
+        logits = logits.float()
+
+        # Compute loss if labels are provided
+        if labels is not None:
+            loss = torch.nn.functional.cross_entropy(
+                logits.view(-1, logits.size(-1)),
+                labels.view(-1),
+                ignore_index=-1,
+                reduction='mean'
+            )
+            return {"loss": loss, "logits": logits}
+        else:
+            return {"loss": None, "logits": logits}
 
 # 3. Create a compatible tokenizer wrapper
 class NanoChatTokenizerWrapper(PreTrainedTokenizer):
@@ -150,7 +212,7 @@ def main():
         max_grad_norm=1.0, bf16=True, logging_steps=10,
         save_steps=1000, save_total_limit=3, dataloader_num_workers=4,
         report_to="wandb", seed=42,
-        gradient_checkpointing = True,
+        gradient_checkpointing=True,  # Enabled with proper implementation
     )
     
     data_collator = DataCollatorForLanguageModeling(hf_tokenizer, mlm=False)
