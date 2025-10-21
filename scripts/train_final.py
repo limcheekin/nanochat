@@ -124,10 +124,11 @@ class UnslothCompatibleGPT(PreTrainedModel):
 
         # Compute loss if labels are provided
         if labels is not None:
+            # DataCollatorForLanguageModeling uses -100 as ignore_index by default
             loss = torch.nn.functional.cross_entropy(
                 logits.view(-1, logits.size(-1)),
                 labels.view(-1),
-                ignore_index=-1,
+                ignore_index=-100,  # Changed from -1 to -100 to match HuggingFace default
                 reduction='mean'
             )
             return {"loss": loss, "logits": logits}
@@ -196,9 +197,18 @@ def main():
     print(f"Dataset prepared with {len(train_dataset):,} examples.")
 
     train_dataset = train_dataset.map(
-        lambda examples: {"input_ids": original_tokenizer.encode(examples["text"], num_threads=os.cpu_count())},
+        lambda examples: {"input_ids": original_tokenizer.encode(examples["text"], num_threads=os.cpu_count() or 1)},
         batched=True, batch_size=1024, remove_columns=list(train_dataset.features),
     )
+
+    # Validate that all token IDs are within the valid range
+    print("Validating tokenized dataset...")
+    sample_batch = train_dataset[:10]
+    for i, ids in enumerate(sample_batch["input_ids"]):
+        max_id = max(ids) if ids else 0
+        if max_id >= vocab_size:
+            print(f"WARNING: Sample {i} has token ID {max_id} >= vocab_size {vocab_size}")
+    print(f"Validation complete. Vocab size: {vocab_size}")
 
     total_batch_size, target_param_data_ratio, base_lr, embedding_lr_scale = 524288, 20, 3e-4, 0.1
     num_params = sum(p.numel() for p in model.parameters())
