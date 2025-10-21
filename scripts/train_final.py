@@ -220,7 +220,7 @@ def main():
         warmup_ratio=0.02, optim="adamw_8bit", weight_decay=0.01,
         max_grad_norm=1.0, bf16=True, logging_steps=10,
         save_steps=1000, save_total_limit=3, dataloader_num_workers=4,
-        report_to=None, seed=42,
+        report_to="none", seed=42,
         gradient_checkpointing=True,  # Enabled with proper implementation
     )
     
