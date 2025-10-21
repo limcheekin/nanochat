@@ -57,8 +57,8 @@ class UnslothCompatibleGPT(PreTrainedModel):
 
     def _set_gradient_checkpointing(self, module, value=False):
         """Enable or disable gradient checkpointing for this model."""
-        if isinstance(module, UnslothCompatibleGPT):
-            module.gradient_checkpointing = value
+        # The module parameter is typically 'self' when called by HF Trainer
+        self.gradient_checkpointing = value
 
     def get_input_embeddings(self):
         module = self.model.transformer.wte
